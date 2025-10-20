@@ -78,22 +78,22 @@ class HungarianMatcher(nn.Module):
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
 
         # Also concat the target labels and boxes
-        tgt_ids = torch.cat([v["labels"] for v in targets])
-        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        tgt_ids = torch.cat([v["labels"] for v in targets])  # 标签类别 [54]
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])  # 真实框 [54，4]
 
         # Compute the classification cost. Contrary to the loss, we don't use the NLL,
         # but approximate it in 1 - proba[target class].
         # The 1 is a constant that doesn't change the matching, it can be ommitted.
         if self.use_focal_loss:
-            out_prob = out_prob[:, tgt_ids]
-            neg_cost_class = (1 - self.alpha) * (out_prob**self.gamma) * (-(1 - out_prob + 1e-8).log())
-            pos_cost_class = self.alpha * ((1 - out_prob)**self.gamma) * (-(out_prob + 1e-8).log())
-            cost_class = pos_cost_class - neg_cost_class        
+            out_prob = out_prob[:, tgt_ids]  # 标签类别的概率[2400,54]
+            neg_cost_class = (1 - self.alpha) * (out_prob**self.gamma) * (-(1 - out_prob + 1e-8).log())  # 负样本损失
+            pos_cost_class = self.alpha * ((1 - out_prob)**self.gamma) * (-(out_prob + 1e-8).log())  # 正样本损失
+            cost_class = pos_cost_class - neg_cost_class        # [2400,54]
         else:
             cost_class = -out_prob[:, tgt_ids]
 
         # Compute the L1 cost between boxes
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)  #边界框损失
 
         # Compute the giou cost betwen boxes
         cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))

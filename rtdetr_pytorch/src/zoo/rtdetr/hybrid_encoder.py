@@ -2,7 +2,9 @@
 '''
 
 import copy
-import torch 
+from typing import Tuple
+
+import torch
 import torch.nn as nn 
 import torch.nn.functional as F 
 
@@ -13,6 +15,7 @@ from src.core import register
 
 __all__ = ['HybridEncoder']
 
+from .visualize import visualize_features
 
 
 class ConvNormLayer(nn.Module):
@@ -84,6 +87,38 @@ class RepVggBlock(nn.Module):
         t = (gamma / std).reshape(-1, 1, 1, 1)
         return kernel * t, beta - running_mean * gamma / std
 
+class MaskPredictor(nn.Module):
+    def __init__(self, in_dim, h_dim):
+        super().__init__()
+        self.h_dim = h_dim
+        self.layer1 = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, h_dim),
+            nn.GELU(),
+        )
+        self.layer2 = nn.Sequential(
+            nn.Linear(h_dim, h_dim // 2),
+            nn.GELU(),
+            nn.Linear(h_dim // 2, h_dim // 4),
+            nn.GELU(),
+            nn.Linear(h_dim // 4, 1),
+        )
+
+        self.apply(self.init_weights)
+
+    @staticmethod
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        z = self.layer1(x)
+        z_local, z_global = torch.split(z, self.h_dim // 2, dim=-1)
+        z_global = z_global.mean(dim=1, keepdim=True).expand(-1, z_local.shape[1], -1)
+        z = torch.cat([z_local, z_global], dim=-1)
+        out = self.layer2(z)
+        return out
 
 class CSPRepLayer(nn.Module):
     def __init__(self,
@@ -195,6 +230,7 @@ class HybridEncoder(nn.Module):
                  expansion=1.0,
                  depth_mult=1.0,
                  act='silu',
+                 level_filter_ratio: Tuple = (0.5, 0.75, 1.0),
                  eval_spatial_size=None):
         super().__init__()
         self.in_channels = in_channels
@@ -229,6 +265,10 @@ class HybridEncoder(nn.Module):
         self.encoder = nn.ModuleList([
             TransformerEncoder(copy.deepcopy(encoder_layer), num_encoder_layers) for _ in range(len(use_encoder_idx))
         ])
+
+        # # new  salience mlp
+        # self.enc_mask_predictor = MaskPredictor(self.hidden_dim, self.hidden_dim)
+
 
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
@@ -299,9 +339,48 @@ class HybridEncoder(nn.Module):
                 memory = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
                 # print([x.is_contiguous() for x in proj_feats ])
+        # # new salience
+        # spatial_shapes = []
+        # level_start_index = [0, ]
+        # batch_size =  memory.shape[0]
+        # salience_score = []
+        # for i, feat in enumerate(proj_feats):
+        #     _, _, h, w = feat.shape
+        #     # [b, c, h, w] -> [b, h*w, c]
+        #
+        #     # [num_levels, 2]
+        #     spatial_shapes.append([h, w])
+        #     # [l], start index of each level
+        #     level_start_index.append(h * w + level_start_index[-1])
+        # for level_idx, feat in enumerate(proj_feats[::-1]):
+        #     level_memory = feat.flatten(2).permute(0, 2, 1)
+        #     # update the memory using the higher-level score_prediction
+        #     if level_idx != spatial_shapes.shape[0] - 1:
+        #         upsample_score = torch.nn.functional.interpolate(
+        #             score,
+        #             size=spatial_shapes[level_idx].unbind(),
+        #             mode="bilinear",
+        #             align_corners=True,
+        #         )
+        #         upsample_score = upsample_score.view(batch_size, -1, spatial_shapes[level_idx].prod())  # 展平
+        #         upsample_score = upsample_score.transpose(1, 2)
+        #         level_memory = level_memory + level_memory * upsample_score * self.alpha[level_idx]
+        #     # predict the foreground score of the current layer
+        #     score = self.enc_mask_predictor(level_memory)
+        #     score = score.transpose(1, 2).view(batch_size, -1, *spatial_shapes[level_idx])
+        #
+        #     # get the topk salience index of the current feature map level
+        #     salience_score.append(score)
 
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
+
+        # for idx, inner_out in enumerate(proj_feats):
+        #     B, C, H, W = inner_out.shape
+        #     out_reshaped = inner_out.view(B, C, H * W).permute(0, 2, 1).reshape(B, H * W, C)
+        #     visualize_features(H, W, out_reshaped, f"特征图{idx}", 10)
+
+
         for idx in range(len(self.in_channels) - 1, 0, -1):
             feat_high = inner_outs[0]
             feat_low = proj_feats[idx - 1]
@@ -311,12 +390,18 @@ class HybridEncoder(nn.Module):
             inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
             inner_outs.insert(0, inner_out)
 
+        B, C, H, W = inner_outs[0].shape
+        out_reshaped = inner_outs[0].view(B, C, H * W).permute(0, 2, 1).reshape(B, H * W, C)
+        visualize_features(H, W, out_reshaped, f"融合后第1层特征图", 10)
         outs = [inner_outs[0]]
         for idx in range(len(self.in_channels) - 1):
             feat_low = outs[-1]
             feat_high = inner_outs[idx + 1]
             downsample_feat = self.downsample_convs[idx](feat_low)
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_high], dim=1))
+            B, C, H, W = out.shape
+            out_reshaped = out.view(B, C, H * W).permute(0, 2, 1).reshape(B, H * W, C)
+            # visualize_features(H, W, out_reshaped, f"融合后第{idx + 2}层特征图", 10)
             outs.append(out)
 
         return outs

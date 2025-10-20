@@ -17,10 +17,13 @@ import torch.amp
 from src.data import CocoEvaluator
 from src.misc import (MetricLogger, SmoothedValue, reduce_dict)
 
+from ..zoo.rtdetr.showplot import showPlot
+
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
+    global indices
     model.train()
     criterion.train()
     metric_logger = MetricLogger(delimiter="  ")
@@ -56,7 +59,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         else:
             outputs = model(samples, targets)
-            loss_dict = criterion(outputs, targets)
+            loss_dict, indices = criterion(outputs, targets)
             
             loss = sum(loss_dict.values())
             optimizer.zero_grad()
@@ -66,6 +69,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
             optimizer.step()
+        showPlot(samples, outputs, targets, indices)
         
         # ema 
         if ema is not None:
@@ -118,7 +122,10 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessors,
         # with torch.autocast(device_type=str(device)):
         #     outputs = model(samples)
 
-        outputs = model(samples)
+        outputs = model(samples, targets)
+
+        # loss_dict, indices = criterion(outputs, targets)
+        # showPlot(samples, outputs, targets, indices)
 
         # loss_dict = criterion(outputs, targets)
         # weight_dict = criterion.weight_dict

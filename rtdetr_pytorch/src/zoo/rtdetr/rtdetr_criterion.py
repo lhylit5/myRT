@@ -17,6 +17,7 @@ from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 from src.misc.dist import get_world_size, is_dist_available_and_initialized
 from src.core import register
 
+from .visualize import visualize_boxes
 
 
 @register
@@ -236,6 +237,27 @@ class SetCriterion(nn.Module):
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
+        first_indices = indices
+        # #遍历outputs的boxes
+
+        # for i in range(len(indices)):
+        #     # 获取当前图片的所有索引
+        #     current_indices = torch.tensor(indices[i][0], dtype=torch.long)
+        #     # 提取当前图片的logits，并找到最大值
+        #     current_logits = outputs['pred_logits'][i][current_indices]  # 获取第i个图片的logits [300,80]
+        #     current_boxes = outputs['pred_boxes'][i][current_indices]  # 使用索引提取boxes
+        #
+        #     imageId = int(targets[i]['image_id'])
+        #     targetBox = targets[i]['boxes']
+        #     # 提取当前图片的boxes
+        #     if self.training:
+        #         imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\train2017\\{:012}.jpg'.format(
+        #             imageId)
+        #     else:
+        #         imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\val2017\\{:012}.jpg'.format(
+        #             imageId)
+        #     visualize_boxes(imagePath, '匹配', current_boxes, current_boxes.size(0))
+        #     visualize_boxes(imagePath, '标签', targetBox, current_boxes.size(0),'red')
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -291,7 +313,7 @@ class SetCriterion(nn.Module):
                     l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
-        return losses
+        return losses, first_indices
 
     @staticmethod
     def get_cdn_matched_indices(dn_meta, targets):

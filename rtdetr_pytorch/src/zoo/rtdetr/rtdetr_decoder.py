@@ -13,9 +13,11 @@ import torch.nn.init as init
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
-
+from .visualize import visualize_boxes, visualize_queries
 
 from src.core import register
+
+from pathlib import Path
 
 
 __all__ = ['RTDETRTransformer']
@@ -243,7 +245,10 @@ class TransformerDecoder(nn.Module):
                 score_head,
                 query_pos_head,
                 attn_mask=None,
-                memory_mask=None):
+                memory_mask=None,
+                samples=None,
+                dn_meta=None):
+        global boxes
         output = tgt
         dec_out_bboxes = []
         dec_out_logits = []
@@ -271,6 +276,26 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
+            # 可视化
+            # imageId = int(targets[0]['image_id'])
+            # first_image_bboxes = inter_ref_bbox[0]
+            # current_path = Path.cwd()
+            # # print(current_path.parents[3] + '\\configs\dataset\coco\\train2017')
+            # if self.training:
+            #     imagePath = 'D:/pythonProject/RT-DETR-main/rtdetr_pytorch/configs/dataset/coco/train2017/{:012}.jpg'.format(
+            #         imageId)
+            # else:
+            #     imagePath = 'D:/pythonProject/RT-DETR-main/rtdetr_pytorch/configs/dataset/coco/val2017/{:012}.jpg'.format(
+            #         imageId)
+            # visualize_boxes(imagePath, f'第{i+1}层解码器', first_image_bboxes, 30)
+            n = 5
+            for j in range(1):
+                if self.training and dn_meta is not None:
+                    _, boxes = torch.split(inter_ref_bbox[j], dn_meta['dn_num_split'], dim=0)
+                    chunks = torch.chunk(boxes, n, dim=0)
+                    for k, chunk in enumerate(chunks):
+                        visualize_boxes(samples[j], f'decoder {i + 1}layer,{k + 1}group', chunk, chunk.shape[0])
+                # visualize_boxes(samples[j], f'decoder {i + 1}layer,{i + 1}group', boxes, 30)
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach(
             ) if self.training else inter_ref_bbox
@@ -457,7 +482,7 @@ class RTDETRTransformer(nn.Module):
             grid_xy = (grid_xy.unsqueeze(0) + 0.5) / valid_WH
             wh = torch.ones_like(grid_xy) * grid_size * (2.0 ** lvl)
             anchors.append(torch.concat([grid_xy, wh], -1).reshape(-1, h * w, 4))
-
+                                                                                                                                                                                                                                                                        
         anchors = torch.concat(anchors, 1).to(device)
         valid_mask = ((anchors > self.eps) * (anchors < 1 - self.eps)).all(-1, keepdim=True)
         anchors = torch.log(anchors / (1 - anchors))
@@ -472,7 +497,9 @@ class RTDETRTransformer(nn.Module):
                            memory,
                            spatial_shapes,
                            denoising_class=None,
-                           denoising_bbox_unact=None):
+                           denoising_bbox_unact=None,
+                           samples=None,
+                           targets=None):
         bs, _, _ = memory.shape
         # prepare input for decoder
         if self.training or self.eval_spatial_size is None:
@@ -494,6 +521,28 @@ class RTDETRTransformer(nn.Module):
             index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_coord_unact.shape[-1]))
 
         enc_topk_bboxes = F.sigmoid(reference_points_unact)
+
+        # 可视化
+        # imageId = int(targets[0]['image_id'])
+        #first_image_bboxes = enc_topk_bboxes[0]
+        # if self.training:
+        #     imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\train2017\\{:012}.jpg'.format(imageId)
+        # else:
+        #     imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\val2017\\{:012}.jpg'.format(imageId)
+        n = 5
+        for i, target in enumerate(targets):
+            # imageId = int(target['image_id'])
+            # imagePath = 'D:/pythonProject/RT-DETR-main/rtdetr_pytorch/configs/dataset/coco/val2017/{:012}.jpg'.format(imageId)
+            # image = cv2.imread(imagePath)
+            boxes = target['boxes']
+            # visualize_queries(samples[i], 'train', boxes, boxes.shape[0], enc_topk_bboxes[i])
+        # for i in range(1):
+        #     boxes = enc_topk_bboxes[i]
+        #     chunks = torch.chunk(boxes, n, dim=0)
+        #     for j, chunk in enumerate(chunks):
+        #         visualize_boxes(samples[i], f'After Encoder,{j+1}group', chunk, chunk.shape[0])
+            # visualize_boxes(samples[i], f'After Encoder,{i + 1}group', boxes, 30)
+
         if denoising_bbox_unact is not None:
             reference_points_unact = torch.concat(
                 [denoising_bbox_unact, reference_points_unact], 1)
@@ -515,7 +564,7 @@ class RTDETRTransformer(nn.Module):
         return target, reference_points_unact.detach(), enc_topk_bboxes, enc_topk_logits
 
 
-    def forward(self, feats, targets=None):
+    def forward(self, feats, samples, targets=None):
 
         # input projection and embedding
         (memory, spatial_shapes, level_start_index) = self._get_encoder_input(feats)
@@ -534,7 +583,7 @@ class RTDETRTransformer(nn.Module):
             denoising_class, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
         target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits = \
-            self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact)
+            self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets)
 
         # decoder
         out_bboxes, out_logits = self.decoder(
@@ -546,7 +595,9 @@ class RTDETRTransformer(nn.Module):
             self.dec_bbox_head,
             self.dec_score_head,
             self.query_pos_head,
-            attn_mask=attn_mask)
+            attn_mask=attn_mask,
+            samples=samples,
+            dn_meta=dn_meta)
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)

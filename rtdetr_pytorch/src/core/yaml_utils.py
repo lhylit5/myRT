@@ -19,7 +19,8 @@ def register(cls: type):
         cls (type): Module class to be registered.
     '''
     if cls.__name__ in GLOBAL_CONFIG:
-        raise ValueError('{} already registered'.format(cls.__name__))
+        return cls
+        # raise ValueError('{} already registered'.format(cls.__name__))
 
     if inspect.isfunction(cls):
         GLOBAL_CONFIG[cls.__name__] = cls

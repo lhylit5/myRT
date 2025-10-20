@@ -5,7 +5,7 @@ import os
 import sys 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import argparse
-
+import torch
 import src.misc.dist as dist 
 from src.core import YAMLConfig 
 from src.solver import TASKS
@@ -25,7 +25,7 @@ def main(args, ) -> None:
         args.config,
         resume=args.resume, 
         use_amp=args.amp,
-        tuning=args.tuning
+        tuning=args.tuning,
     )
 
     solver = TASKS[cfg.yaml_cfg['task']](cfg)
@@ -39,12 +39,15 @@ def main(args, ) -> None:
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', '-c', type=str, )
-    parser.add_argument('--resume', '-r', type=str, )
+    parser.add_argument('--config', '-c', type=str, default="../configs/rtdetr/rtdetr_r50vd_6x_coco.yml")
+    # parser.add_argument('--resume', '-r', type=str, default="../tools/output/rtdetr_r50vd_6x_coco/checkpoint0019.pth")
+    parser.add_argument('--resume', '-r', type=str,)
     parser.add_argument('--tuning', '-t', type=str, )
-    parser.add_argument('--test-only', action='store_true', default=False,)
+    parser.add_argument('--test-only', action='store_true', default=False)
     parser.add_argument('--amp', action='store_true', default=False,)
     parser.add_argument('--seed', type=int, help='seed',)
+    parser.add_argument('--epoches', type=int, default=1)
+    # parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 
     main(args)
