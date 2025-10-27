@@ -46,7 +46,7 @@ if __name__ == '__main__':
     parser.add_argument('--test-only', action='store_true', default=False)
     parser.add_argument('--amp', action='store_true', default=False,)
     parser.add_argument('--seed', type=int, help='seed',)
-    parser.add_argument('--epoches', type=int, default=1)
+    parser.add_argument('--epoches', type=int, default=10)
     # parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 

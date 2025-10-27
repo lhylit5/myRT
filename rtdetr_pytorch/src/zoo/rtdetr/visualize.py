@@ -85,7 +85,7 @@ def visualize_boxes(image, phase, bboxes, nums, color='green'):
 
         # 保存图片
         # plt.savefig(filename)
-        plt.show()
+        # plt.show()
         plt.close(fig)
     group += 1
     if group == 6:
@@ -97,25 +97,21 @@ def visualize_boxes(image, phase, bboxes, nums, color='green'):
 
     # 显示图形
     # plt.show()
+
 def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
-    # bbox = bboxes
-    # bbox = torchvision.ops.box_convert(bbox, in_fmt='cxcywh', out_fmt='xyxy')
-    # bbox = bbox.detach().cpu().numpy()
-    #
-    # # 将bbox的值从[0,1]缩放到图像尺寸
-    # bbox_img = (bbox * np.array([image.shape[1], image.shape[0], image.shape[1], image.shape[0]]))
-    # bbox_img = bbox_img.astype(int)
-    # for bbox in bbox_img[:nums]:
-    #     # 确保每个 bbox 是整数
-    #     bbox = bbox.astype(int)
-    #
-    #     # 绘制每个矩形
-    #     cv2.rectangle(image, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 1)
-    #
-    # # 显示图像
-    # cv2.imshow('Bboxes', image)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
+    """
+    可视化query
+    Args:
+        image: sample图片
+        phase: 训练/验证标识
+        bboxes: 标签中各个真实框，xywh格式
+        nums: 标签中真实框个数
+        queries: queries对应的enc_topk_bboxes（根据中心位置可视化）
+        color: 可视化颜色
+
+    Returns:
+
+    """
     global query_count, queries_center
     global layer
     global group
@@ -132,6 +128,7 @@ def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
             bboxes = bboxes.detach().cpu().numpy()
             bbox_img = bboxes
         else:
+            # 得到标签真实框
             bboxes = box_cxcywh_to_xyxy(bboxes)
             # bboxes = torchvision.ops.box_convert(bboxes, in_fmt='cxcywh', out_fmt='xyxy')
             bboxes = bboxes.detach().cpu().numpy()
@@ -139,26 +136,6 @@ def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
 
             queries = queries.detach().cpu().numpy()
             queries_center = (queries * np.array([image.shape[1], image.shape[0], image.shape[1], image.shape[0]])).astype(int)
-
-        # else:
-        #     bbox_img = bboxes.detach().cpu().numpy().astype(int)
-        # # 显示原始图像
-        # plt.imshow(image_rgb)
-        # for i, bbox in enumerate(bbox_img[:nums]):
-        #     # 绘制边界框
-        #     plt.gca().add_patch(plt.Rectangle((bbox[0], bbox[1]), bbox[2] - bbox[0], bbox[3] - bbox[1],
-        #                                       fill=False, edgecolor=color, linewidth=1))
-        #
-        #     # 可以在这里添加文本标签，例如 i+1 表示第几个边界框
-        #     plt.gca().text(bbox[0], bbox[1], str(i + 1), color='white', fontsize=12,
-        #                    bbox=dict(facecolor='green', alpha=0.5))
-        #
-        # # 移除坐标轴
-        # plt.axis('off')
-        #
-        # # 显示图形
-        # plt.show()
-        # 创建一个图形，每个边界框一个子图
         # image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         fig, ax = plt.subplots(1, 1, figsize=(10, 10))  # 创建一个子图
         fig.suptitle(phase, fontsize=20, y=0.06)
@@ -194,7 +171,7 @@ def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
 
         # 保存图片
         plt.savefig(filename)
-        # plt.show()
+        plt.show()
         plt.close(fig)
     bs += 1
     # if group == 6:

@@ -288,13 +288,13 @@ class TransformerDecoder(nn.Module):
             #     imagePath = 'D:/pythonProject/RT-DETR-main/rtdetr_pytorch/configs/dataset/coco/val2017/{:012}.jpg'.format(
             #         imageId)
             # visualize_boxes(imagePath, f'第{i+1}层解码器', first_image_bboxes, 30)
-            n = 5
-            for j in range(1):
-                if self.training and dn_meta is not None:
-                    _, boxes = torch.split(inter_ref_bbox[j], dn_meta['dn_num_split'], dim=0)
-                    chunks = torch.chunk(boxes, n, dim=0)
-                    for k, chunk in enumerate(chunks):
-                        visualize_boxes(samples[j], f'decoder {i + 1}layer,{k + 1}group', chunk, chunk.shape[0])
+            # n = 5
+            # for j in range(1):
+            #     if self.training and dn_meta is not None:
+            #         _, boxes = torch.split(inter_ref_bbox[j], dn_meta['dn_num_split'], dim=0)
+            #         chunks = torch.chunk(boxes, n, dim=0)
+            #         for k, chunk in enumerate(chunks):
+            #             visualize_boxes(samples[j], f'decoder {i + 1}layer,{k + 1}group', chunk, chunk.shape[0])
                 # visualize_boxes(samples[j], f'decoder {i + 1}layer,{i + 1}group', boxes, 30)
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach(
@@ -519,23 +519,11 @@ class RTDETRTransformer(nn.Module):
         
         reference_points_unact = enc_outputs_coord_unact.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_coord_unact.shape[-1]))
-
+        # top300 query的cx,cy,w,h
         enc_topk_bboxes = F.sigmoid(reference_points_unact)
-
-        # 可视化
-        # imageId = int(targets[0]['image_id'])
-        #first_image_bboxes = enc_topk_bboxes[0]
-        # if self.training:
-        #     imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\train2017\\{:012}.jpg'.format(imageId)
-        # else:
-        #     imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\val2017\\{:012}.jpg'.format(imageId)
-        n = 5
         for i, target in enumerate(targets):
-            # imageId = int(target['image_id'])
-            # imagePath = 'D:/pythonProject/RT-DETR-main/rtdetr_pytorch/configs/dataset/coco/val2017/{:012}.jpg'.format(imageId)
-            # image = cv2.imread(imagePath)
             boxes = target['boxes']
-            # visualize_queries(samples[i], 'train', boxes, boxes.shape[0], enc_topk_bboxes[i])
+            visualize_queries(samples[i], 'train', boxes, boxes.shape[0], enc_topk_bboxes[i])
         # for i in range(1):
         #     boxes = enc_topk_bboxes[i]
         #     chunks = torch.chunk(boxes, n, dim=0)

@@ -392,7 +392,7 @@ class HybridEncoder(nn.Module):
 
         B, C, H, W = inner_outs[0].shape
         out_reshaped = inner_outs[0].view(B, C, H * W).permute(0, 2, 1).reshape(B, H * W, C)
-        visualize_features(H, W, out_reshaped, f"融合后第1层特征图", 10)
+        # visualize_features(H, W, out_reshaped, f"融合后第1层特征图", 10)
         outs = [inner_outs[0]]
         for idx in range(len(self.in_channels) - 1):
             feat_low = outs[-1]

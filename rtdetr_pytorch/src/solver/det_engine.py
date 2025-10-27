@@ -69,7 +69,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
             optimizer.step()
-        showPlot(samples, outputs, targets, indices)
+        # showPlot(samples, outputs, targets, indices)
         
         # ema 
         if ema is not None:
