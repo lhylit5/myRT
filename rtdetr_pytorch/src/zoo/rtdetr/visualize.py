@@ -98,7 +98,7 @@ def visualize_boxes(image, phase, bboxes, nums, color='green'):
     # 显示图形
     # plt.show()
 
-def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
+def visualize_queries(image, isTraining, bboxes, nums, queries, color='green'):
     """
     可视化query
     Args:
@@ -123,22 +123,22 @@ def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
         # image = cv2.imread(imagePath)
         # if phase != '标签':
         # 将bbox的值从[0,1]缩放到图像尺寸
-        if phase == '验证':
-            # bboxes = box_cxcywh_to_xyxy(bboxes)
-            bboxes = bboxes.detach().cpu().numpy()
-            bbox_img = bboxes
-        else:
+        if isTraining :
             # 得到标签真实框
             bboxes = box_cxcywh_to_xyxy(bboxes)
             # bboxes = torchvision.ops.box_convert(bboxes, in_fmt='cxcywh', out_fmt='xyxy')
             bboxes = bboxes.detach().cpu().numpy()
             bbox_img = (bboxes * np.array([image.shape[1], image.shape[0], image.shape[1], image.shape[0]])).astype(int)
+        else:
+            # bboxes = box_cxcywh_to_xyxy(bboxes)
+            bboxes = bboxes.detach().cpu().numpy()
+            bbox_img = bboxes
 
-            queries = queries.detach().cpu().numpy()
-            queries_center = (queries * np.array([image.shape[1], image.shape[0], image.shape[1], image.shape[0]])).astype(int)
+        queries = queries.detach().cpu().numpy()
+        queries_center = (queries * np.array([image.shape[1], image.shape[0], image.shape[1], image.shape[0]])).astype(int)
         # image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         fig, ax = plt.subplots(1, 1, figsize=(10, 10))  # 创建一个子图
-        fig.suptitle(phase, fontsize=20, y=0.06)
+        fig.suptitle("training" if isTraining else "test", fontsize=20, y=0.06)
         # 绘制原始图像
         ax.imshow(image)
 
@@ -156,7 +156,7 @@ def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
             cx, cy = query[0], query[1]
 
             # 绘制中心点（红色实心圆点，尺寸12）
-            ax.scatter(cx, cy, color='blue', s=50, marker='o', zorder=3)
+            ax.scatter(cx, cy, color='blue', s=20, marker='o', zorder=3)
 
             # # 添加带背景的文本标签（偏移量防止遮挡）
             # ax.text(cx + 5, cy - 5, str(i + 1),
@@ -170,8 +170,8 @@ def visualize_queries(image, phase, bboxes, nums, queries, color='green'):
         filename = "./output/image/epoch_1/queries/{:0>12d}_{:0>2d}.png".format(query_count, bs)
 
         # 保存图片
-        plt.savefig(filename)
-        plt.show()
+        # plt.savefig(filename)
+        # plt.show()
         plt.close(fig)
     bs += 1
     # if group == 6:

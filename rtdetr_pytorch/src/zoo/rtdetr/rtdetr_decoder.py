@@ -523,7 +523,7 @@ class RTDETRTransformer(nn.Module):
         enc_topk_bboxes = F.sigmoid(reference_points_unact)
         for i, target in enumerate(targets):
             boxes = target['boxes']
-            visualize_queries(samples[i], 'train', boxes, boxes.shape[0], enc_topk_bboxes[i])
+            visualize_queries(samples[i], self.training, boxes, boxes.shape[0], enc_topk_bboxes[i])
         # for i in range(1):
         #     boxes = enc_topk_bboxes[i]
         #     chunks = torch.chunk(boxes, n, dim=0)

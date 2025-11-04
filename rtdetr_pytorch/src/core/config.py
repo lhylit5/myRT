@@ -1,6 +1,6 @@
 """by lyuwenyu
 """
-
+import os
 from pprint import pprint
 import torch 
 import torch.nn as nn 
@@ -71,9 +71,33 @@ class BaseConfig(object):
         self.checkpoint_step :int = 1
 
         # self.device :str = torch.device('cpu')
-        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-        # device = 'cuda：2' if torch.cuda.is_available() else 'cpu'
-        self.device = torch.device(device)
+        # device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        # # device = 'cuda：2' if torch.cuda.is_available() else 'cpu'
+        # self.device = torch.device(device)
+
+        # 优先使用 launcher 注入的 LOCAL_RANK（torchrun 会设置）
+        _local_rank_env = os.environ.get("LOCAL_RANK")
+        if _local_rank_env is None:
+            # 在某些环境变量名不同或单进程调试时，可以再尝试 TORCH_LOCAL_RANK 或默认 0
+            _local_rank_env = os.environ.get("TORCH_LOCAL_RANK")
+
+        if torch.cuda.is_available():
+            try:
+                local_rank = int(_local_rank_env) if _local_rank_env is not None else 0
+            except ValueError:
+                local_rank = 0
+
+            # 可见设备数（受 CUDA_VISIBLE_DEVICES 影响）
+            visible_count = torch.cuda.device_count()
+            if local_rank >= visible_count:
+                # 提醒并防止越界
+                raise RuntimeError(f"LOCAL_RANK ({local_rank}) >= visible cuda device count ({visible_count}). "
+                                   "Check --nproc_per_node and CUDA_VISIBLE_DEVICES.")
+            # 把每个进程绑定到它自己的本地 GPU
+            torch.cuda.set_device(local_rank)
+            self.device = torch.device(f"cuda:{local_rank}")
+        else:
+            self.device = torch.device("cpu")
 
 
 

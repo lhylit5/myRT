@@ -17,6 +17,13 @@ __all__ = ['HybridEncoder']
 
 from .visualize import visualize_features
 
+# 在文件顶部加上 import
+try:
+    # 调整为你的实际路径
+    from .small_object_enhance import SmallObjectEnhance
+except Exception:
+    from src.models.small_object_enhance import SmallObjectEnhance
+
 
 class ConvNormLayer(nn.Module):
     def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act=None):
@@ -216,7 +223,9 @@ class TransformerEncoder(nn.Module):
 
 @register
 class HybridEncoder(nn.Module):
+    __inject__ = ['small_object_enhance']
     def __init__(self,
+                 small_object_enhance=None,
                  in_channels=[512, 1024, 2048],
                  feat_strides=[8, 16, 32],
                  hidden_dim=256,
@@ -233,6 +242,8 @@ class HybridEncoder(nn.Module):
                  level_filter_ratio: Tuple = (0.5, 0.75, 1.0),
                  eval_spatial_size=None):
         super().__init__()
+        self.small_object_enhance= small_object_enhance  # 保存配置
+        # self.small_enhance = small_enhance
         self.in_channels = in_channels
         self.feat_strides = feat_strides
         self.hidden_dim = hidden_dim
@@ -268,7 +279,24 @@ class HybridEncoder(nn.Module):
 
         # # new  salience mlp
         # self.enc_mask_predictor = MaskPredictor(self.hidden_dim, self.hidden_dim)
-
+        # -----------------------------------------
+        # 在这里实例化 small_enhance（注意放在 input_proj 创建之后）
+        # -----------------------------------------
+        self.small_enhance = None
+        # if isinstance(self.small_enhance_cfg, dict) and self.small_enhance_cfg.get('USE', False):
+        #     # 确保给定 in_ch 与 hidden_dim 一致，或者以 hidden_dim 为准
+        #     cfg = dict(self.small_enhance_cfg)  # shallow copy
+        #     # 如果用户没有显式传 in_ch，强制设为 hidden_dim
+        #     cfg.setdefault('in_ch', hidden_dim)
+        #     # instantiate
+        #     self.small_enhance = SmallObjectEnhance(
+        #         in_ch=cfg['in_ch'],
+        #         mid_ch=cfg.get('mid_ch', cfg['in_ch']),
+        #         ccm_cfg=tuple(cfg.get('ccm_cfg', (cfg['in_ch'], cfg['in_ch']))),
+        #         dilation=cfg.get('dilation', 2),
+        #         use_aux=cfg.get('use_aux', False),
+        #         use_gn=cfg.get('use_gn', True)
+        #     )
 
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
@@ -323,7 +351,13 @@ class HybridEncoder(nn.Module):
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
-        
+        # 调用 small_enhance 对最大分辨率的特征进行增强
+        # ===== insert: apply small-object enhance to largest-scale feature =====
+        if getattr(self, 'small_object_enhance', None) is not None:
+            # small_enhance expects list/tuple of multi-scale features and returns same-shape list
+            proj_feats = self.small_object_enhance(proj_feats)
+        # =====================================================================
+
         # encoder
         if self.num_encoder_layers > 0:
             for i, enc_ind in enumerate(self.use_encoder_idx):
@@ -338,48 +372,8 @@ class HybridEncoder(nn.Module):
 
                 memory = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
-                # print([x.is_contiguous() for x in proj_feats ])
-        # # new salience
-        # spatial_shapes = []
-        # level_start_index = [0, ]
-        # batch_size =  memory.shape[0]
-        # salience_score = []
-        # for i, feat in enumerate(proj_feats):
-        #     _, _, h, w = feat.shape
-        #     # [b, c, h, w] -> [b, h*w, c]
-        #
-        #     # [num_levels, 2]
-        #     spatial_shapes.append([h, w])
-        #     # [l], start index of each level
-        #     level_start_index.append(h * w + level_start_index[-1])
-        # for level_idx, feat in enumerate(proj_feats[::-1]):
-        #     level_memory = feat.flatten(2).permute(0, 2, 1)
-        #     # update the memory using the higher-level score_prediction
-        #     if level_idx != spatial_shapes.shape[0] - 1:
-        #         upsample_score = torch.nn.functional.interpolate(
-        #             score,
-        #             size=spatial_shapes[level_idx].unbind(),
-        #             mode="bilinear",
-        #             align_corners=True,
-        #         )
-        #         upsample_score = upsample_score.view(batch_size, -1, spatial_shapes[level_idx].prod())  # 展平
-        #         upsample_score = upsample_score.transpose(1, 2)
-        #         level_memory = level_memory + level_memory * upsample_score * self.alpha[level_idx]
-        #     # predict the foreground score of the current layer
-        #     score = self.enc_mask_predictor(level_memory)
-        #     score = score.transpose(1, 2).view(batch_size, -1, *spatial_shapes[level_idx])
-        #
-        #     # get the topk salience index of the current feature map level
-        #     salience_score.append(score)
 
-        # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
-
-        # for idx, inner_out in enumerate(proj_feats):
-        #     B, C, H, W = inner_out.shape
-        #     out_reshaped = inner_out.view(B, C, H * W).permute(0, 2, 1).reshape(B, H * W, C)
-        #     visualize_features(H, W, out_reshaped, f"特征图{idx}", 10)
-
 
         for idx in range(len(self.in_channels) - 1, 0, -1):
             feat_high = inner_outs[0]

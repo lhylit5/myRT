@@ -42,6 +42,15 @@ HybridEncoder:
   # eval
   eval_spatial_size: [640, 640]
 
+  small_object_enhance: SmallObjectEnhance
+
+SmallObjectEnhance:
+  _name: SmallObjectEnhance
+  in_ch: 256
+  mid_ch: 256
+  ccm_cfg: [256, 256]
+  dilation: 2
+  use_bn: True
 
 RTDETRTransformer:
   feat_channels: [256, 256, 256]
