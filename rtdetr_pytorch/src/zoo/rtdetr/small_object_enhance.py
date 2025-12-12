@@ -140,7 +140,7 @@ class ChannelGate(nn.Module):
 # ----------------------------
 @register
 class SmallObjectEnhance(nn.Module):
-    def __init__(self, in_ch=256, mid_ch=256, ccm_cfg=(256, 256), dilation=2,
+    def __init__(self, in_ch=256, mid_ch=512, ccm_cfg=(512, 512, 256, 256), dilation=2,
                  use_aux=False, reduction_ratio=16, pool_types=['avg', 'max'], use_bn=True):
         """
         in_ch: 输入特征通道（通常 256）
@@ -191,8 +191,8 @@ class SmallObjectEnhance(nn.Module):
         Ws = self.spatial_gate(Fc)  # [B,1,H,W]
         mask_for_S = F.interpolate(Ws, size=(H, W), mode='bilinear', align_corners=False)
         enhanced_S = S * (1.0 + self.alpha * mask_for_S)
-
-        # 通道注意力
+        # enhanced_S = S * Ws
+        # # 通道注意力
         Wc = self.channel_gate(Fc)  # [B, ccm_out_ch, 1, 1]
         if Wc.size(1) == C0:
             enhanced_S = enhanced_S * Wc

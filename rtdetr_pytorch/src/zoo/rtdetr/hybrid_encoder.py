@@ -242,7 +242,7 @@ class HybridEncoder(nn.Module):
                  level_filter_ratio: Tuple = (0.5, 0.75, 1.0),
                  eval_spatial_size=None):
         super().__init__()
-        self.small_object_enhance= small_object_enhance  # 保存配置
+        self.small_object_enhance = small_object_enhance  # 保存配置
         # self.small_enhance = small_enhance
         self.in_channels = in_channels
         self.feat_strides = feat_strides
@@ -276,27 +276,6 @@ class HybridEncoder(nn.Module):
         self.encoder = nn.ModuleList([
             TransformerEncoder(copy.deepcopy(encoder_layer), num_encoder_layers) for _ in range(len(use_encoder_idx))
         ])
-
-        # # new  salience mlp
-        # self.enc_mask_predictor = MaskPredictor(self.hidden_dim, self.hidden_dim)
-        # -----------------------------------------
-        # 在这里实例化 small_enhance（注意放在 input_proj 创建之后）
-        # -----------------------------------------
-        self.small_enhance = None
-        # if isinstance(self.small_enhance_cfg, dict) and self.small_enhance_cfg.get('USE', False):
-        #     # 确保给定 in_ch 与 hidden_dim 一致，或者以 hidden_dim 为准
-        #     cfg = dict(self.small_enhance_cfg)  # shallow copy
-        #     # 如果用户没有显式传 in_ch，强制设为 hidden_dim
-        #     cfg.setdefault('in_ch', hidden_dim)
-        #     # instantiate
-        #     self.small_enhance = SmallObjectEnhance(
-        #         in_ch=cfg['in_ch'],
-        #         mid_ch=cfg.get('mid_ch', cfg['in_ch']),
-        #         ccm_cfg=tuple(cfg.get('ccm_cfg', (cfg['in_ch'], cfg['in_ch']))),
-        #         dilation=cfg.get('dilation', 2),
-        #         use_aux=cfg.get('use_aux', False),
-        #         use_gn=cfg.get('use_gn', True)
-        #     )
 
         # top-down fpn
         self.lateral_convs = nn.ModuleList()

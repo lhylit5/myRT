@@ -47,8 +47,8 @@ HybridEncoder:
 SmallObjectEnhance:
   _name: SmallObjectEnhance
   in_ch: 256
-  mid_ch: 256
-  ccm_cfg: [256, 256]
+  mid_ch: 512
+  ccm_cfg: [512, 512, 256, 256]
   dilation: 2
   use_bn: True
 

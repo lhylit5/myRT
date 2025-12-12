@@ -6,7 +6,7 @@
       <paths name="501_6card">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/lhy/RT-DETR" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/data/lhy/RT-DETR" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
