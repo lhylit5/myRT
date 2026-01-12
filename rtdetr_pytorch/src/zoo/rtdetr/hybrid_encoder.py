@@ -330,11 +330,19 @@ class HybridEncoder(nn.Module):
     def forward(self, feats):
         assert len(feats) == len(self.in_channels)
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
+
+        # 1. 捕获增强前的 S3 特征 (这就是 Baseline 的水平)
+        feat_s3_before = proj_feats[0]
+        # 定义一个变量存储密度图，防止没开启增强时报错
+        pred_density_map = None
+        feat_s3_after = feat_s3_before # 默认情况：如果没有增强，前后一致
         # 调用 small_enhance 对最大分辨率的特征进行增强
         # ===== insert: apply small-object enhance to largest-scale feature =====
         if getattr(self, 'small_object_enhance', None) is not None:
             # small_enhance expects list/tuple of multi-scale features and returns same-shape list
-            proj_feats = self.small_object_enhance(proj_feats)
+            proj_feats, pred_density_map = self.small_object_enhance(proj_feats)
+            # 捕获增强后的 S3 特征
+            feat_s3_after = proj_feats[0]
         # =====================================================================
 
         # encoder
@@ -377,4 +385,4 @@ class HybridEncoder(nn.Module):
             # visualize_features(H, W, out_reshaped, f"融合后第{idx + 2}层特征图", 10)
             outs.append(out)
 
-        return outs
+        return outs, pred_density_map, feat_s3_before, feat_s3_after

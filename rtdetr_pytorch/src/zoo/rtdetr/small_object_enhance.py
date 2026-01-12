@@ -141,7 +141,7 @@ class ChannelGate(nn.Module):
 @register
 class SmallObjectEnhance(nn.Module):
     def __init__(self, in_ch=256, mid_ch=512, ccm_cfg=(512, 512, 256, 256), dilation=2,
-                 use_aux=False, reduction_ratio=16, pool_types=['avg', 'max'], use_bn=True):
+                 use_aux=False, reduction_ratio=16, pool_types=['avg', 'max'], use_bn=True,use_feature_enhance=True):
         """
         in_ch: 输入特征通道（通常 256）
         mid_ch: 1x1 映射通道
@@ -149,12 +149,13 @@ class SmallObjectEnhance(nn.Module):
         dilation: 膨胀率
         use_aux: 保留接口
         use_bn: SpatialGate 中是否使用 BatchNorm（默认 True，参照 DQ-DETR）
+        use_feature_enhance: 如果为 False，模块只输出密度图，不改变输入特征（用于单独测试创新点2）
         """
         super().__init__()
         self.in_ch = in_ch
         self.mid_ch = mid_ch
         self.use_aux = use_aux
-
+        self.use_feature_enhance = use_feature_enhance
         # 1x1 映射（不含归一化）
         self.conv1 = ConvSimple(in_ch, mid_ch, kernel_size=1, padding=0, relu=True, bias=False)
 
@@ -167,12 +168,19 @@ class SmallObjectEnhance(nn.Module):
         self.ccm = nn.Sequential(*layers)
         self.ccm_out_ch = ccm_cfg[-1]
 
-        # 空间与通道门（SpatialGate 使用 Conv_BN）
-        self.spatial_gate = SpatialGate(kernel_size=7, use_bn=use_bn)
-        self.channel_gate = ChannelGate(self.ccm_out_ch, reduction_ratio=reduction_ratio, pool_types=pool_types)
+        # === 【新增 1】密度图预测头 ===
+        # 将 CCM 特征 (256ch) 映射为 密度图 (1ch)
+        self.density_head = nn.Conv2d(self.ccm_out_ch, 1, kernel_size=1, bias=False)
+        self.relu = nn.ReLU(inplace=True)
 
-        # 可学习系数
-        self.alpha = nn.Parameter(torch.tensor(1.0))
+        # 只有在需要增强时才初始化 Attention 模块，节省参数量（或者保留但 forward 时跳过）
+        if self.use_feature_enhance:
+            # 空间与通道门（SpatialGate 使用 Conv_BN）
+            self.spatial_gate = SpatialGate(kernel_size=7, use_bn=use_bn)
+            self.channel_gate = ChannelGate(self.ccm_out_ch, reduction_ratio=reduction_ratio, pool_types=pool_types)
+
+            # 可学习系数
+            self.alpha = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, feats):
         if not isinstance(feats, (list, tuple)):
@@ -187,20 +195,25 @@ class SmallObjectEnhance(nn.Module):
         # CCM -> Fc
         Fc = self.ccm(v)   # [B, ccm_out_ch, H, W]
 
-        # 空间注意力
-        Ws = self.spatial_gate(Fc)  # [B,1,H,W]
-        mask_for_S = F.interpolate(Ws, size=(H, W), mode='bilinear', align_corners=False)
-        enhanced_S = S * (1.0 + self.alpha * mask_for_S)
-        # enhanced_S = S * Ws
-        # # 通道注意力
-        Wc = self.channel_gate(Fc)  # [B, ccm_out_ch, 1, 1]
-        if Wc.size(1) == C0:
-            enhanced_S = enhanced_S * Wc
-        else:
-            # 保守方案：用 Wc 的均值作为整体缩放（避免新增参数）
-            Wc_scalar = Wc.mean(dim=1, keepdim=True)  # [B,1,1,1]
-            enhanced_S = enhanced_S * Wc_scalar
-
+        # === 【新增 2】生成预测的密度图 ===
+        # 使用 ReLU 保证非负
+        pred_density_map = self.relu(self.density_head(Fc))  # [B, 1, H, W]
+        # 2. 根据配置决定是否做特征增强
+        enhanced_S = S
+        if self.use_feature_enhance:
+            # 空间注意力
+            Ws = self.spatial_gate(Fc)  # [B,1,H,W]
+            mask_for_S = F.interpolate(Ws, size=(H, W), mode='bilinear', align_corners=False)
+            enhanced_S = S * (1.0 + self.alpha * mask_for_S)
+            # enhanced_S = S * Ws
+            # # 通道注意力
+            Wc = self.channel_gate(Fc)  # [B, ccm_out_ch, 1, 1]
+            if Wc.size(1) == C0:
+                enhanced_S = enhanced_S * Wc
+            else:
+                # 保守方案：用 Wc 的均值作为整体缩放（避免新增参数）
+                Wc_scalar = Wc.mean(dim=1, keepdim=True)  # [B,1,1,1]
+                enhanced_S = enhanced_S * Wc_scalar
         out_feats = list(feats)
         out_feats[0] = enhanced_S
-        return out_feats
+        return out_feats, pred_density_map

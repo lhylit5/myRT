@@ -9,6 +9,7 @@ RTDETR:
   backbone: PResNet
   encoder: HybridEncoder
   decoder: RTDETRTransformer
+  use_density_query_selection: True
   multi_scale: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800]
 
 PResNet:
@@ -51,6 +52,7 @@ SmallObjectEnhance:
   ccm_cfg: [512, 512, 256, 256]
   dilation: 2
   use_bn: True
+  use_feature_enhance: True
 
 RTDETRTransformer:
   feat_channels: [256, 256, 256]
@@ -74,10 +76,12 @@ RTDETRPostProcessor:
 
 
 SetCriterion:
-  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2,}
-  losses: ['vfl', 'boxes', ]
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_density: 4.0}
+  losses: ['vfl', 'boxes', 'density']
   alpha: 0.75
   gamma: 2.0
+
+  use_density_aux_loss: False
 
   matcher:
     type: HungarianMatcher

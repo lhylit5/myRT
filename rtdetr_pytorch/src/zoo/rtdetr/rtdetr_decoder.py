@@ -499,7 +499,8 @@ class RTDETRTransformer(nn.Module):
                            denoising_class=None,
                            denoising_bbox_unact=None,
                            samples=None,
-                           targets=None):
+                           targets=None,
+                           density_map=None):
         bs, _, _ = memory.shape
         # prepare input for decoder
         if self.training or self.eval_spatial_size is None:
@@ -514,16 +515,59 @@ class RTDETRTransformer(nn.Module):
 
         enc_outputs_class = self.enc_score_head(output_memory)
         enc_outputs_coord_unact = self.enc_bbox_head(output_memory) + anchors
+        # ====================================================================================
+        # === 创新点二核心逻辑：基于密度的 Query 选择 ===
+        # ====================================================================================
+        if density_map is not None:
+            # density_map 来自 S3 层: [B, 1, H3, W3]
+            # 1. 获取 S3 层的 Anchor 数量
+            # spatial_shapes[0] 是 S3 的 (H, W)，通常是 [80, 80]
+            num_s3_anchors = spatial_shapes[0][0] * spatial_shapes[0][1]
 
-        _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
+            # 2. 展平密度图: [B, 1, H3, W3] -> [B, H3*W3, 1]
+            density_score_s3 = density_map.flatten(2).permute(0, 2, 1)
+
+            # 3. 构建全尺度密度分数 (S3+S4+S5)
+            # 初始化全为 0，大小匹配 total_anchors
+            total_anchors = enc_outputs_class.shape[1]
+            full_density_score = torch.zeros(
+                (bs, total_anchors, 1),
+                device=enc_outputs_class.device,
+                dtype=enc_outputs_class.dtype
+            )
+
+            # 4. 仅填充 S3 部分 (假设 S3 是第一个拼接的特征，RT-DETR 默认如此)
+            if total_anchors >= num_s3_anchors:
+                full_density_score[:, :num_s3_anchors, :] = density_score_s3
+
+                # 5. 融合分数
+                # 先将 logits 转为概率 (0~1)
+                enc_probs = enc_outputs_class.sigmoid()
+                # 取每个 Anchor 最大类别的概率
+                topk_score_cls = enc_probs.max(-1).values  # [B, Total_Anchors]
+
+                # 融合公式：分类概率 + 密度分数
+                # 密度分数在小目标区域经过面积加权后很大(>1)，能显著提升其排名
+                alpha = 0.1
+                mixed_score = topk_score_cls + alpha * full_density_score.squeeze(-1)
+
+                # 6. 根据融合分数选 Top-K 索引
+                _, topk_ind = torch.topk(mixed_score, self.num_queries, dim=1)
+            else:
+                # 异常回退（理论上不会发生）
+                _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
+        else:
+            # 原版逻辑：仅根据分类分数选 Top-K
+            _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
         
         reference_points_unact = enc_outputs_coord_unact.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_coord_unact.shape[-1]))
         # top300 query的cx,cy,w,h
         enc_topk_bboxes = F.sigmoid(reference_points_unact)
-        for i, target in enumerate(targets):
-            boxes = target['boxes']
-            visualize_queries(samples[i], self.training, boxes, boxes.shape[0], enc_topk_bboxes[i])
+        if targets is not None:
+            for i, target in enumerate(targets):
+                boxes = target['boxes']
+                visualize_queries(samples[i], self.training, boxes, boxes.shape[0], enc_topk_bboxes[i])
         # for i in range(1):
         #     boxes = enc_topk_bboxes[i]
         #     chunks = torch.chunk(boxes, n, dim=0)
@@ -552,7 +596,7 @@ class RTDETRTransformer(nn.Module):
         return target, reference_points_unact.detach(), enc_topk_bboxes, enc_topk_logits
 
 
-    def forward(self, feats, samples, targets=None):
+    def forward(self, feats, samples, targets=None, density_map=None):
 
         # input projection and embedding
         (memory, spatial_shapes, level_start_index) = self._get_encoder_input(feats)
@@ -571,7 +615,7 @@ class RTDETRTransformer(nn.Module):
             denoising_class, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
         target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits = \
-            self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets)
+            self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets, density_map)
 
         # decoder
         out_bboxes, out_logits = self.decoder(

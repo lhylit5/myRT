@@ -20,6 +20,109 @@ from src.core import register
 from .visualize import visualize_boxes
 
 
+# ==========================================
+# === 创新点三：密度引导的一对多匹配器 ===
+# ==========================================
+class DensityGuidedMatcher(nn.Module):
+    """
+    Density-Guided One-to-Many Matcher for Auxiliary Training
+    """
+
+    def __init__(self, weight_dict, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.weight_dict = weight_dict
+        self.alpha = alpha
+        self.gamma = gamma
+
+        # 代价系数 (可调整)
+        self.cost_class = 2.0
+        self.cost_bbox = 5.0
+        self.cost_giou = 2.0
+        self.cost_density = 1.0  # 密度代价的权重
+
+    @torch.no_grad()
+    def forward(self, outputs, targets, density_map):
+        """
+        density_map: [B, 1, H, W] 面积加权密度图
+        """
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+
+        # 1. 展平预测
+        out_prob = outputs["pred_logits"].flatten(0, 1).sigmoid()
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)
+
+        # 2. 准备 GT
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+
+        # 3. 计算基础 Matching Cost
+        # Focal Loss Cost
+        neg_cost_class = (1 - self.alpha) * (out_prob ** self.gamma) * (-(1 - out_prob + 1e-8).log())
+        pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
+        cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+
+        # Regression Cost
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+
+        # 4. === 核心创新：计算密度一致性代价 (Density Cost) ===
+        indices = []
+        cur_idx = 0
+
+        for i in range(bs):
+            # 获取当前图的 targets
+            tgt_ids_i = targets[i]["labels"]
+            tgt_bbox_i = targets[i]["boxes"]
+            num_gt = len(tgt_ids_i)
+
+            if num_gt == 0:
+                indices.append((torch.as_tensor([], dtype=torch.int64), torch.as_tensor([], dtype=torch.int64)))
+                cur_idx += num_queries
+                continue
+
+            # 切片获取当前图的 Cost
+            c_class = cost_class[cur_idx: cur_idx + num_queries, :num_gt]
+            c_bbox = cost_bbox[cur_idx: cur_idx + num_queries, :num_gt]
+            c_giou = cost_giou[cur_idx: cur_idx + num_queries, :num_gt]
+
+            # === 计算当前图的 Density Cost ===
+            current_density = density_map[i].unsqueeze(0)  # [1, 1, H, W]
+            current_centers = outputs["pred_boxes"][i, :, :2]
+            grid_coords = current_centers.view(1, num_queries, 1, 2) * 2.0 - 1.0
+
+            # 采样密度值，密度越大(3.0+)，cost越小(-3.0)
+            sampled_density = F.grid_sample(current_density, grid_coords, align_corners=False).view(num_queries)
+            c_density = -sampled_density.unsqueeze(1).repeat(1, num_gt)
+
+            # === 总 Cost ===
+            C = self.cost_bbox * c_bbox + \
+                self.cost_class * c_class + \
+                self.cost_giou * c_giou + \
+                self.cost_density * c_density
+
+            # === 尺度感知的一对多选择 (Scale-Aware Top-K) ===
+            tgt_areas = tgt_bbox_i[:, 2] * tgt_bbox_i[:, 3]
+            is_small = tgt_areas < 0.005
+
+            src_ind_list = []
+            tgt_ind_list = []
+
+            for gt_idx in range(num_gt):
+                # 小目标选 6 个，大目标选 2 个
+                k = 6 if is_small[gt_idx] else 2
+                _, topk_indices = torch.topk(C[:, gt_idx], k, largest=False)
+
+                src_ind_list.append(topk_indices)
+                tgt_ind_list.append(torch.full_like(topk_indices, gt_idx))
+
+            src_ind = torch.cat(src_ind_list)
+            tgt_ind = torch.cat(tgt_ind_list)
+
+            indices.append((src_ind, tgt_ind))
+            cur_idx += num_queries
+
+        return indices
+
 @register
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
@@ -30,7 +133,7 @@ class SetCriterion(nn.Module):
     __share__ = ['num_classes', ]
     __inject__ = ['matcher', ]
 
-    def __init__(self, matcher, weight_dict, losses, alpha=0.2, gamma=2.0, eos_coef=1e-4, num_classes=80):
+    def __init__(self, matcher, weight_dict, losses, alpha=0.2, gamma=2.0, eos_coef=1e-4, num_classes=80, use_density_aux_loss=False):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -43,7 +146,10 @@ class SetCriterion(nn.Module):
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
-        self.losses = losses 
+        self.losses = losses
+
+        # === 保存开关配置 ===
+        self.use_density_aux_loss = use_density_aux_loss
 
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = eos_coef
@@ -52,6 +158,29 @@ class SetCriterion(nn.Module):
         self.alpha = alpha
         self.gamma = gamma
 
+        # 初始化辅助匹配器
+        self.aux_matcher = DensityGuidedMatcher(weight_dict, alpha, gamma)
+
+    # === 【新增 2】密度 Loss 计算函数 ===
+    def loss_density(self, outputs, targets, indices, num_boxes, **kwargs):
+        """计算 MSE Loss"""
+        if 'pred_density_map' not in outputs:
+            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
+
+        src_map = outputs['pred_density_map']  # [B, 1, H, W]
+
+        # 动态生成 GT (不需要梯度)
+        with torch.no_grad():
+            target_map = generate_density_map_gt(
+                targets,
+                (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
+                src_map.device,
+                sigma=2.0  # 对于 Stride=8 (S3)，sigma=2.0 比较合适
+            )
+
+        # 计算 MSE
+        loss = F.mse_loss(src_map, target_map)
+        return {'loss_density': loss}
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
@@ -222,6 +351,9 @@ class SetCriterion(nn.Module):
             'bce': self.loss_labels_bce,
             'focal': self.loss_labels_focal,
             'vfl': self.loss_labels_vfl,
+
+            # === 【新增 3】注册 density ===
+            'density': self.loss_density,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -237,27 +369,12 @@ class SetCriterion(nn.Module):
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
+        # 2. === 创新点3：密度引导的一对多匹配 (可配置开关) ===
+        indices_o2m = None
+        # 只有当【开关开启】且【存在密度图】时，才执行辅助匹配
+        if self.use_density_aux_loss and 'pred_density_map' in outputs:
+            indices_o2m = self.aux_matcher(outputs_without_aux, targets, outputs['pred_density_map'])
         first_indices = indices
-        # #遍历outputs的boxes
-
-        # for i in range(len(indices)):
-        #     # 获取当前图片的所有索引
-        #     current_indices = torch.tensor(indices[i][0], dtype=torch.long)
-        #     # 提取当前图片的logits，并找到最大值
-        #     current_logits = outputs['pred_logits'][i][current_indices]  # 获取第i个图片的logits [300,80]
-        #     current_boxes = outputs['pred_boxes'][i][current_indices]  # 使用索引提取boxes
-        #
-        #     imageId = int(targets[i]['image_id'])
-        #     targetBox = targets[i]['boxes']
-        #     # 提取当前图片的boxes
-        #     if self.training:
-        #         imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\train2017\\{:012}.jpg'.format(
-        #             imageId)
-        #     else:
-        #         imagePath = 'D:\pythonProject\RT-DETR-main\\rtdetr_pytorch\configs\dataset\coco\\val2017\\{:012}.jpg'.format(
-        #             imageId)
-        #     visualize_boxes(imagePath, '匹配', current_boxes, current_boxes.size(0))
-        #     visualize_boxes(imagePath, '标签', targetBox, current_boxes.size(0),'red')
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -272,6 +389,24 @@ class SetCriterion(nn.Module):
             l_dict = self.get_loss(loss, outputs, targets, indices, num_boxes)
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
+
+        # 4. === 计算辅助 Loss (One-to-Many) ===
+        if indices_o2m is not None:
+            # 【关键修改】降低权重，防止梯度冲突破坏主分支
+            # 建议设置为 0.1 ~ 0.5 之间。
+            # 这相当于告诉模型：“主要听一对一的，但也要适当参考密度图的建议”
+            aux_weight_scale = 0.2
+
+            aux_loss_types = ['vfl', 'boxes'] if 'vfl' in self.losses else ['labels', 'boxes']
+            if 'focal' in self.losses: aux_loss_types = ['focal', 'boxes']
+
+            for loss in aux_loss_types:
+                if loss not in self.losses: continue
+                l_dict = self.get_loss(loss, outputs, targets, indices_o2m, num_boxes)
+                # 乘上 aux_weight_scale
+                l_dict = {f"{k}_o2m": v * self.weight_dict.get(k, 1.0) * aux_weight_scale for k, v in
+                          l_dict.items()}
+                losses.update(l_dict)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -337,8 +472,88 @@ class SetCriterion(nn.Module):
         return dn_match_indices
 
 
+# === 【新增 1】GT 生成工具函数 (加在 SetCriterion 类外面) ===
 
+def generate_density_map_gt(targets, feat_shape, device, sigma=2.0):
+    """
+    生成【面积加权】的高斯密度图 GT。
+    面积越小的物体，其高斯热图的峰值权重越高。
+    """
+    B, H, W = feat_shape
+    density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
 
+    # 坐标网格
+    y_range = torch.arange(H, device=device)
+    x_range = torch.arange(W, device=device)
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+
+    for i in range(B):
+        if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+            continue
+
+        boxes = targets[i]['boxes']  # [N, 4] (cx, cy, w, h)
+
+        # === 核心修改：计算面积权重 ===
+        # w, h 是归一化的 (0~1)。面积 area = w * h
+        areas = boxes[:, 2] * boxes[:, 3]
+
+        # 加权公式：weight = 1 + alpha * exp(-beta * area)
+        # 这里的参数经过调优，能让极小目标权重达到 5.0，大目标维持在 1.0
+        # 你可以根据数据集微调 scale_factor (beta)
+        scale_factor = 100.0
+        weights = 1.0 + 4.0 * torch.exp(-areas * scale_factor)
+
+        # 归一化坐标转特征图绝对坐标
+        cx = boxes[:, 0] * W
+        cy = boxes[:, 1] * H
+
+        # 逐个目标生成高斯并加权
+        # (注：此处为了代码清晰使用了循环，N 通常不大，训练耗时可忽略)
+        for j in range(len(boxes)):
+            dist_sq = (grid_x - cx[j]) ** 2 + (grid_y - cy[j]) ** 2
+            gaussian = torch.exp(-dist_sq / (2 * sigma ** 2))
+
+            # 应用权重！
+            weighted_gaussian = gaussian * weights[j]
+
+            # 使用 Max 融合 (保留局部最强响应)
+            density_map[i, 0] = torch.maximum(density_map[i, 0], weighted_gaussian)
+
+    return density_map
+# def generate_density_map_gt(targets, feat_shape, device, sigma=2.0):
+#     """
+#     targets: list[dict], 每个 dict 包含 'boxes' (N, 4) [cx, cy, w, h] 归一化坐标
+#     feat_shape: (B, H, W)
+#     """
+#     B, H, W = feat_shape
+#     density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
+#
+#     # 坐标网格
+#     y_range = torch.arange(H, device=device)
+#     x_range = torch.arange(W, device=device)
+#     grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+#
+#     for i in range(B):
+#         if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+#             continue
+#
+#         boxes = targets[i]['boxes']  # [N, 4]
+#         # 归一化坐标转特征图绝对坐标
+#         cx = boxes[:, 0] * W
+#         cy = boxes[:, 1] * H
+#
+#         # 矢量化计算高斯
+#         # shape: [N, H, W]
+#         dist_sq = (grid_x.unsqueeze(0) - cx.view(-1, 1, 1)) ** 2 + \
+#                   (grid_y.unsqueeze(0) - cy.view(-1, 1, 1)) ** 2
+#         gaussians = torch.exp(-dist_sq / (2 * sigma ** 2))
+#
+#         # 取最大响应作为该像素的密度值 (适合检测任务)
+#         if gaussians.shape[0] > 0:
+#             val, _ = gaussians.max(dim=0)
+#             density_map[i, 0] = val
+#
+#     return density_map
 
 @torch.no_grad()
 def accuracy(output, target, topk=(1,)):
