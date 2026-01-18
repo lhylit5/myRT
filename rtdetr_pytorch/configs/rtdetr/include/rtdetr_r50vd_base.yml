@@ -43,7 +43,7 @@ HybridEncoder:
   # eval
   eval_spatial_size: [640, 640]
 
-  small_object_enhance: SmallObjectEnhance
+  small_object_enhance:
 
 SmallObjectEnhance:
   _name: SmallObjectEnhance

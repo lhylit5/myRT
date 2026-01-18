@@ -56,17 +56,19 @@ class RTDETR(nn.Module):
         x = self.backbone(x)
         # === 修改 1: 接收 4 个返回值 ===
         # 原来是: x, pred_density_map = self.encoder(x)
-        x, pred_density_map, feat_before, feat_after = self.encoder(x)
+        x_enc, pred_density_map, feat_before, feat_after = self.encoder(x)
         # 2. 将密度图传给 decoder (仅当开关开启且有密度图时)
         # 注意：你需要修改 Decoder 的 forward 签名来接收这个参数
         density_map_for_decoder = pred_density_map if self.use_density_query_selection else None
-        x = self.decoder(x, samples, targets, density_map=density_map_for_decoder)
+        x = self.decoder(x_enc, samples, targets, density_map=density_map_for_decoder)
         # === 【新增】将密度图加入输出字典 ===
         # 只有在训练阶段且密度图存在时才需要加入
         if pred_density_map is not None:
             x['pred_density_map'] = pred_density_map
             # 仅在推理/验证模式下保存特征图，节省训练显存
         if not self.training:
+            # x_enc[0] 就是 S3 特征 (Stride=8)，分辨率最高，包含小目标信息最多
+            x['encoder_output_s3'] = x_enc[0]
             if feat_before is not None:
                 x['feat_before'] = feat_before
             if feat_after is not None:

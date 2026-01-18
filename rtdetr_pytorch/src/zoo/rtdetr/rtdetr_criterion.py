@@ -76,7 +76,10 @@ class DensityGuidedMatcher(nn.Module):
             num_gt = len(tgt_ids_i)
 
             if num_gt == 0:
-                indices.append((torch.as_tensor([], dtype=torch.int64), torch.as_tensor([], dtype=torch.int64)))
+                indices.append((
+                    torch.as_tensor([], dtype=torch.int64, device=out_bbox.device),
+                    torch.as_tensor([], dtype=torch.int64, device=out_bbox.device)
+                ))
                 cur_idx += num_queries
                 continue
 
