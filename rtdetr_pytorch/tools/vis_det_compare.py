@@ -29,7 +29,7 @@ VAL_IMG_DIR = os.path.join(COCO_ROOT, 'val2017')
 VAL_ANN_FILE = os.path.join(COCO_ROOT, 'annotations/instances_val2017.json')
 
 # 3. 输出设置
-SAVE_DIR = "vis_results_comparison"
+SAVE_DIR = "output/vis_results_comparison"
 CONF_THRES = 0.35  # 显示框的置信度阈值
 ZOOM_FACTOR = 3  # 局部放大的倍数
 ZOOM_SIZE = 160  # 局部放大窗口的像素大小 (正方形)

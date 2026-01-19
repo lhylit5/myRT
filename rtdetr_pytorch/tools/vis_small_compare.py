@@ -24,7 +24,7 @@ VAL_IMG_DIR = os.path.join(COCO_ROOT, 'val2017')
 VAL_ANN_FILE = os.path.join(COCO_ROOT, 'annotations/instances_val2017.json')
 
 # 3. 可视化参数
-SAVE_DIR = "vis_final_v3_clear_labels"
+SAVE_DIR = "output/vis_final_v3_clear_labels"
 CONF_THRES = 0.3  # 预测置信度阈值
 IOU_THRES_SMALL = 32 * 32  # 面积阈值，只看小目标
 ZOOM_FACTOR = 4  # 放大倍数
