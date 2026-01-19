@@ -81,7 +81,7 @@ SetCriterion:
   alpha: 0.75
   gamma: 2.0
 
-  use_density_aux_loss: False
+  use_density_aux_loss: True
 
   matcher:
     type: HungarianMatcher

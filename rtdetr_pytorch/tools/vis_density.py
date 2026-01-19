@@ -25,7 +25,7 @@ COCO_ROOT = '../configs/dataset/coco'
 VAL_IMG_DIR = os.path.join(COCO_ROOT, 'val2017')
 VAL_ANN_FILE = os.path.join(COCO_ROOT, 'annotations/instances_val2017.json')
 # 4. 保存路径
-SAVE_DIR = "vis_paper_results"
+SAVE_DIR = "output/vis_paper_results"
 
 # === 新增功能：指定图片 ID ===
 # 如果列表不为空，脚本将【只可视化】这些 ID 的图片 (用于论文定向截图)
