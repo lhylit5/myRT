@@ -35,9 +35,9 @@ class DensityGuidedMatcher(nn.Module):
         self.gamma = gamma
 
         # 代价系数
-        self.cost_class = weight_dict['cost_class']
-        self.cost_bbox = weight_dict['cost_bbox']
-        self.cost_giou = weight_dict['cost_giou']
+        self.cost_class = 2
+        self.cost_bbox = 5
+        self.cost_giou = 2
         self.cost_density = 1.0
 
     @torch.no_grad()
@@ -122,7 +122,7 @@ class DensityGuidedMatcher(nn.Module):
             matching_matrix = torch.zeros_like(C, dtype=torch.bool)
 
             for gt_idx in range(num_gt):
-                k = 6 if is_small[gt_idx] else 2
+                k = 6 if is_small[gt_idx] else 4
                 k = min(k, num_queries)
                 _, topk_indices = torch.topk(C[:, gt_idx], k, largest=False)
                 matching_matrix[topk_indices, gt_idx] = True
@@ -199,135 +199,115 @@ class SetCriterion(nn.Module):
         if 'gt_density_map' in kwargs:
             target_map = kwargs['gt_density_map']
         # 动态生成 GT (不需要梯度)
-        with torch.no_grad():
-            target_map = generate_density_map_gt(
-                targets,
-                (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
-                src_map.device,
-                sigma=2.0  # 对于 Stride=8 (S3)，sigma=2.0 比较合适
-            )
+        else:
+            with torch.no_grad():
+                target_map = generate_density_map_gt(
+                    targets,
+                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
+                    src_map.device,
+                    sigma=2.0
+                )
 
         # 计算 MSE
         loss = F.mse_loss(src_map, target_map)
         return {'loss_density': loss}
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
+    # =========================================================================
+    # === 修复：所有标准 Loss 函数必须接收 **kwargs 以忽略多余参数 (如 gt_density_map) ===
+    # =========================================================================
+
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
-
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64,
+                                    device=src_logits.device)
         target_classes[idx] = target_classes_o
-
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         losses = {'loss_ce': loss_ce}
-
-        if log:
-            # TODO this should probably be a separate loss, not hacked in this one here
-            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
 
-    def loss_labels_bce(self, outputs, targets, indices, num_boxes, log=True):
-        src_logits = outputs['pred_logits']
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
-
-        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
-        loss = F.binary_cross_entropy_with_logits(src_logits, target * 1., reduction='none')
-        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
-        return {'loss_bce': loss}
-
-    def loss_labels_focal(self, outputs, targets, indices, num_boxes, log=True):
+    def loss_labels_focal(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
-
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64,
+                                    device=src_logits.device)
         target_classes[idx] = target_classes_o
-
-        target = F.one_hot(target_classes, num_classes=self.num_classes+1)[..., :-1]
-        # ce_loss = F.binary_cross_entropy_with_logits(src_logits, target * 1., reduction="none")
-        # prob = F.sigmoid(src_logits) # TODO .detach()
-        # p_t = prob * target + (1 - prob) * (1 - target)
-        # alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
-        # loss = alpha_t * ce_loss * ((1 - p_t) ** self.gamma)
-        # loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
         loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
-
         return {'loss_focal': loss}
 
-    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, log=True):
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
-
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
         ious = torch.diag(ious).detach()
-
         src_logits = outputs['pred_logits']
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64,
+                                    device=src_logits.device)
         target_classes[idx] = target_classes_o
         target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
-
         target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
         target_score_o[idx] = ious.to(target_score_o.dtype)
         target_score = target_score_o.unsqueeze(-1) * target
-
         pred_score = F.sigmoid(src_logits).detach()
         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
-        
         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {'loss_vfl': loss}
 
     @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, num_boxes):
-        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
-        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
-        """
+    def loss_cardinality(self, outputs, targets, indices, num_boxes, **kwargs):
         pred_logits = outputs['pred_logits']
         device = pred_logits.device
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-        # Count the number of predictions that are NOT "no-object" (which is the last class)
         card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
-        """
+    def loss_boxes(self, outputs, targets, indices, num_boxes, **kwargs):
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-
         losses = {}
-
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
         loss_giou = 1 - torch.diag(generalized_box_iou(
-                box_cxcywh_to_xyxy(src_boxes),
-                box_cxcywh_to_xyxy(target_boxes)))
+            box_cxcywh_to_xyxy(src_boxes),
+            box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
+
+    def loss_labels_bce(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
+        src_logits = outputs['pred_logits']
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+        loss = F.binary_cross_entropy_with_logits(src_logits, target * 1., reduction='none')
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {'loss_bce': loss}
+
+    def _get_src_permutation_idx(self, indices):
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_tgt_permutation_idx(self, indices):
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the masks: the focal loss and the dice loss.
@@ -358,17 +338,6 @@ class SetCriterion(nn.Module):
         }
         return losses
 
-    def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
-
-    def _get_tgt_permutation_idx(self, indices):
-        # permute targets following indices
-        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
-        return batch_idx, tgt_idx
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
@@ -398,19 +367,28 @@ class SetCriterion(nn.Module):
         # 定义一个变量保存 GT Density Map，供 Loss 使用，避免重复计算
         gt_density_map = None
 
-        if self.use_density_aux_loss and 'pred_density_map' in outputs:
+        if self.use_density_aux_loss and 'o2m_outputs' in outputs:
+            # === 关键：使用 O2M 输出进行辅助匹配 ===
+            o2m_outputs = outputs['o2m_outputs']
+            # === 【关键修改：获取形状参考】 ===
+            # 优先用 pred_density_map (如果有)，没有就用 S3 特征图
+            if 'pred_density_map' in outputs:
+                ref_map = outputs['pred_density_map']
+            elif 's3_shape_ref' in outputs:
+                ref_map = outputs['s3_shape_ref']
+            else:
+                raise ValueError("No reference map found to generate GT density!")
             # === 生成 GT Density Map 用于匹配 (修正点1) ===
-            src_map = outputs['pred_density_map']
             with torch.no_grad():
                 gt_density_map = generate_density_map_gt(
                     targets,
-                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
-                    src_map.device,
+                    (ref_map.shape[0], ref_map.shape[2], ref_map.shape[3]),
+                    ref_map.device,
                     sigma=2.0
                 )
 
-            # 传入 GT Map 进行匹配
-            indices_o2m_raw = self.aux_matcher(outputs_without_aux, targets, gt_density_map)
+            # 将 O2M 输出传给匹配器 (使用 O2M Head 的 logits)
+            indices_o2m_raw = self.aux_matcher(o2m_outputs, targets, gt_density_map)
 
             # === 【修正点3：强制一致性 (Consistency Enforcement)】 ===
             # 策略：如果主匹配 (O2O) 认为 Query A 是 GT B，那么辅助匹配 (O2M) 也必须包含这个配对
@@ -458,13 +436,15 @@ class SetCriterion(nn.Module):
 
         # 辅助 Loss (Density Guided)
         if indices_o2m is not None:
-            aux_weight_scale = 0.2
+            aux_weight_scale = 1.0
             aux_loss_types = ['vfl', 'boxes'] if 'vfl' in self.losses else ['labels', 'boxes']
             if 'focal' in self.losses: aux_loss_types = ['focal', 'boxes']
 
             for loss in aux_loss_types:
                 if loss not in self.losses: continue
-                l_dict = self.get_loss(loss, outputs, targets, indices_o2m, num_boxes)
+                # === 关键：传入 outputs['o2m_outputs'] ===
+                # 这样梯度会回传给 dec_score_head_o2m，而不会污染主分支
+                l_dict = self.get_loss(loss, outputs['o2m_outputs'], targets, indices_o2m, num_boxes)
                 l_dict = {f"{k}_o2m": v * self.weight_dict.get(k, 1.0) * aux_weight_scale for k, v in l_dict.items()}
                 losses.update(l_dict)
 

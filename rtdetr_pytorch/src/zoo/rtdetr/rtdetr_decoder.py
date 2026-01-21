@@ -247,11 +247,13 @@ class TransformerDecoder(nn.Module):
                 attn_mask=None,
                 memory_mask=None,
                 samples=None,
-                dn_meta=None):
+                dn_meta=None,
+                score_head_o2m=None):
         global boxes
         output = tgt
         dec_out_bboxes = []
         dec_out_logits = []
+        dec_out_logits_o2m = []  # O2M logits 列表
         ref_points_detach = F.sigmoid(ref_points_unact)
 
         for i, layer in enumerate(self.layers):
@@ -266,6 +268,9 @@ class TransformerDecoder(nn.Module):
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
+                # === [修改 2] 计算 O2M Logits ===
+                if score_head_o2m is not None:
+                    dec_out_logits_o2m.append(score_head_o2m[i](output))
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
@@ -276,31 +281,14 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
-            # 可视化
-            # imageId = int(targets[0]['image_id'])
-            # first_image_bboxes = inter_ref_bbox[0]
-            # current_path = Path.cwd()
-            # # print(current_path.parents[3] + '\\configs\dataset\coco\\train2017')
-            # if self.training:
-            #     imagePath = 'D:/pythonProject/RT-DETR-main/rtdetr_pytorch/configs/dataset/coco/train2017/{:012}.jpg'.format(
-            #         imageId)
-            # else:
-            #     imagePath = 'D:/pythonProject/RT-DETR-main/rtdetr_pytorch/configs/dataset/coco/val2017/{:012}.jpg'.format(
-            #         imageId)
-            # visualize_boxes(imagePath, f'第{i+1}层解码器', first_image_bboxes, 30)
-            # n = 5
-            # for j in range(1):
-            #     if self.training and dn_meta is not None:
-            #         _, boxes = torch.split(inter_ref_bbox[j], dn_meta['dn_num_split'], dim=0)
-            #         chunks = torch.chunk(boxes, n, dim=0)
-            #         for k, chunk in enumerate(chunks):
-            #             visualize_boxes(samples[j], f'decoder {i + 1}layer,{k + 1}group', chunk, chunk.shape[0])
-                # visualize_boxes(samples[j], f'decoder {i + 1}layer,{i + 1}group', boxes, 30)
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach(
             ) if self.training else inter_ref_bbox
+        # === [修改 3] 返回 O2M Logits ===
+        if self.training and len(dec_out_logits_o2m) > 0:
+            return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), torch.stack(dec_out_logits_o2m)
 
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits)
+        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), None
 
 
 @register
@@ -387,6 +375,10 @@ class RTDETRTransformer(nn.Module):
             for _ in range(num_decoder_layers)
         ])
 
+        # === [修改 4] 定义独立的 O2M Head ===
+        # 复制主分支的分类头，作为一对多(One-to-Many)辅助分支的专用头
+        self.dec_score_head_o2m = copy.deepcopy(self.dec_score_head)
+
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
             self.anchors, self.valid_mask = self._generate_anchors()
@@ -404,6 +396,10 @@ class RTDETRTransformer(nn.Module):
             init.constant_(cls_.bias, bias)
             init.constant_(reg_.layers[-1].weight, 0)
             init.constant_(reg_.layers[-1].bias, 0)
+
+        # === [修改 5] 初始化 O2M Head 的 Bias ===
+        for cls_ in self.dec_score_head_o2m:
+            init.constant_(cls_.bias, bias)
         
         # linear_init_(self.enc_output[0])
         init.xavier_uniform_(self.enc_output[0].weight)
@@ -616,9 +612,9 @@ class RTDETRTransformer(nn.Module):
 
         target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits = \
             self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets, density_map)
-
         # decoder
-        out_bboxes, out_logits = self.decoder(
+        # === [修改 6] 传入 dec_score_head_o2m ===
+        out_bboxes, out_logits, out_logits_o2m = self.decoder(
             target,
             init_ref_points_unact,
             memory,
@@ -629,11 +625,16 @@ class RTDETRTransformer(nn.Module):
             self.query_pos_head,
             attn_mask=attn_mask,
             samples=samples,
-            dn_meta=dn_meta)
+            dn_meta=dn_meta,
+            score_head_o2m=self.dec_score_head_o2m if self.training else None)
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
+            # === [修改 7] 如果有 O2M 输出，同样做 DN 切分 ===
+            if out_logits_o2m is not None:
+                _, out_logits_o2m = torch.split(out_logits_o2m, dn_meta['dn_num_split'], dim=2)
+
 
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
 
@@ -644,6 +645,15 @@ class RTDETRTransformer(nn.Module):
             if self.training and dn_meta is not None:
                 out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
                 out['dn_meta'] = dn_meta
+
+        # === [修改 8] 封装 O2M 输出到字典 ===
+        if self.training and out_logits_o2m is not None:
+            # 使用最后一层的 O2M logits
+            # 共享 BBox (out_bboxes[-1])
+            out['o2m_outputs'] = {
+                'pred_logits': out_logits_o2m[-1],
+                'pred_boxes': out_bboxes[-1]
+            }
 
         return out
 

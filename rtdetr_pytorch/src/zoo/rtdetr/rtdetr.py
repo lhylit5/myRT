@@ -65,14 +65,15 @@ class RTDETR(nn.Module):
         # 只有在训练阶段且密度图存在时才需要加入
         if pred_density_map is not None:
             x['pred_density_map'] = pred_density_map
-            # 仅在推理/验证模式下保存特征图，节省训练显存
+        else:
+            # 2. 【新增】始终保存 S3 特征图作为 "形状参考 (Shape Reference)"
+            # 即使 pred_density_map 为 None，我们也可以用它来生成 GT 密度图
+            x['s3_shape_ref'] = feat_after  # [B, C, H_s3, W_s3]
         if not self.training:
             # x_enc[0] 就是 S3 特征 (Stride=8)，分辨率最高，包含小目标信息最多
             x['encoder_output_s3'] = x_enc[0]
             if feat_before is not None:
                 x['feat_before'] = feat_before
-            if feat_after is not None:
-                x['feat_after'] = feat_after
         return x
     
     def deploy(self, ):
