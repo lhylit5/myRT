@@ -67,11 +67,10 @@ class DensityGuidedMatcher(nn.Module):
         indices = []
         cur_idx = 0
 
-        # === 【修正点1】归一化密度图 ===
-        # 你的 weights 最大有 5.0，如果不归一化，Cost 很容易爆炸
-        # 按每张图的最大值进行归一化，保持在 0-1 之间
-        max_vals = density_map.flatten(2).max(2)[0][..., None, None]  # [B, 1, 1, 1]
-        density_map_norm = density_map / (max_vals + 1e-6)
+        # === 【修改：移除动态最大值归一化，改为全局缩放】 ===
+        # 你的 GT 生成公式最大值约为 5.0 (1.0 + 4.0)。
+        # 为了让 density 在 0~1 之间且保留大小物体差异，除以固定值 5.0
+        density_map_norm = density_map / 5.0
 
         for i in range(bs):
             tgt_ids_i = targets[i]["labels"]
@@ -205,7 +204,7 @@ class SetCriterion(nn.Module):
                     targets,
                     (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
                     src_map.device,
-                    sigma=2.0
+                    sigma=2.0,
                 )
 
         # 计算 MSE
@@ -356,6 +355,44 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
+        # ==========================================================
+        # === 优化 1：将一致性合并逻辑提取为静态方法 (对齐 MS-DETR) ===
+        # ==========================================================
+    @staticmethod
+    def indices_merge(indices_o2o, indices_o2m_raw):
+        """
+        合并 O2O 和 O2M 的匹配结果。
+        策略：Union (并集)，且 O2M 优先级更高 (MS-DETR 逻辑)。
+        """
+        final_indices_o2m = []
+        for i, (src_o2m, tgt_o2m) in enumerate(indices_o2m_raw):
+            src_o2o, tgt_o2o = indices_o2o[i]
+
+            # 1. 先放入 O2O (主匹配结果)
+            # 使用字典 {Query_ID: GT_ID}
+            match_dict = {s.item(): t.item() for s, t in zip(src_o2o, tgt_o2o)}
+
+            # 2. 再放入 O2M (辅助匹配结果)
+            # === 关键优化 ===
+            # MS-DETR 逻辑是：temp_indices[o2m_idx] = o2m_gt
+            # 这意味着如果同一个 Query 在 O2O 和 O2M 中都被选中，
+            # 以 O2M 的分配为准 (通常两者是一样的，但如果有冲突，O2M 优先)
+            for s, t in zip(src_o2m, tgt_o2m):
+                match_dict[s.item()] = t.item()
+
+            # 3. 重建 Tensor
+            if len(match_dict) > 0:
+                sorted_src = sorted(match_dict.keys())
+                new_src = torch.as_tensor(sorted_src, dtype=torch.int64, device=src_o2m.device)
+                new_tgt = torch.as_tensor([match_dict[s] for s in sorted_src], dtype=torch.int64,
+                                          device=tgt_o2m.device)
+            else:
+                new_src = torch.as_tensor([], dtype=torch.int64, device=src_o2m.device)
+                new_tgt = torch.as_tensor([], dtype=torch.int64, device=tgt_o2m.device)
+
+            final_indices_o2m.append((new_src, new_tgt))
+
+        return final_indices_o2m
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
@@ -371,49 +408,24 @@ class SetCriterion(nn.Module):
             # === 关键：使用 O2M 输出进行辅助匹配 ===
             o2m_outputs = outputs['o2m_outputs']
             # === 【关键修改：获取形状参考】 ===
-            # 优先用 pred_density_map (如果有)，没有就用 S3 特征图
-            if 'pred_density_map' in outputs:
-                ref_map = outputs['pred_density_map']
-            elif 's3_shape_ref' in outputs:
-                ref_map = outputs['s3_shape_ref']
-            else:
-                raise ValueError("No reference map found to generate GT density!")
+            # === 更紧凑的 Reference Map 获取逻辑 ===
+            ref_map = outputs.get('pred_density_map', outputs.get('s3_shape_ref', None))
+            if ref_map is None:
+                raise ValueError("No reference map (pred_density_map or s3_shape_ref) found!")
             # === 生成 GT Density Map 用于匹配 (修正点1) ===
             with torch.no_grad():
                 gt_density_map = generate_density_map_gt(
                     targets,
                     (ref_map.shape[0], ref_map.shape[2], ref_map.shape[3]),
                     ref_map.device,
-                    sigma=2.0
+                    sigma=1.0
                 )
 
             # 将 O2M 输出传给匹配器 (使用 O2M Head 的 logits)
             indices_o2m_raw = self.aux_matcher(o2m_outputs, targets, gt_density_map)
 
-            # === 【修正点3：强制一致性 (Consistency Enforcement)】 ===
-            # 策略：如果主匹配 (O2O) 认为 Query A 是 GT B，那么辅助匹配 (O2M) 也必须包含这个配对
-            final_indices_o2m = []
-            for i, (src_o2m, tgt_o2m) in enumerate(indices_o2m_raw):
-                src_o2o, tgt_o2o = indices[i]
-
-                # 使用字典合并：O2O 的结果覆盖/添加到 O2M 中
-                match_dict = {s.item(): t.item() for s, t in zip(src_o2m, tgt_o2m)}
-                for s, t in zip(src_o2o, tgt_o2o):
-                    match_dict[s.item()] = t.item()
-
-                # 重建 Tensor
-                if len(match_dict) > 0:
-                    sorted_src = sorted(match_dict.keys())
-                    new_src = torch.as_tensor(sorted_src, dtype=torch.int64, device=src_o2m.device)
-                    new_tgt = torch.as_tensor([match_dict[s] for s in sorted_src], dtype=torch.int64,
-                                              device=tgt_o2m.device)
-                else:
-                    new_src = torch.as_tensor([], dtype=torch.int64, device=src_o2m.device)
-                    new_tgt = torch.as_tensor([], dtype=torch.int64, device=tgt_o2m.device)
-
-                final_indices_o2m.append((new_src, new_tgt))
-
-            indices_o2m = final_indices_o2m
+            # === 调用优化后的一致性合并 ===
+            indices_o2m = self.indices_merge(indices, indices_o2m_raw)
 
         # 计算 Loss
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -436,7 +448,7 @@ class SetCriterion(nn.Module):
 
         # 辅助 Loss (Density Guided)
         if indices_o2m is not None:
-            aux_weight_scale = 1.0
+            aux_weight_scale = 0.2
             aux_loss_types = ['vfl', 'boxes'] if 'vfl' in self.losses else ['labels', 'boxes']
             if 'focal' in self.losses: aux_loss_types = ['focal', 'boxes']
 
@@ -447,6 +459,26 @@ class SetCriterion(nn.Module):
                 l_dict = self.get_loss(loss, outputs['o2m_outputs'], targets, indices_o2m, num_boxes)
                 l_dict = {f"{k}_o2m": v * self.weight_dict.get(k, 1.0) * aux_weight_scale for k, v in l_dict.items()}
                 losses.update(l_dict)
+
+            # === 6. 辅助分支 Loss (O2M - Deep Supervision) ===
+            # 这里是之前缺失的部分！
+            if 'aux_outputs' in outputs['o2m_outputs']:
+                for i, aux_outputs in enumerate(outputs['o2m_outputs']['aux_outputs']):
+                    # 为了严谨，每一层应该重新匹配。
+                    # 复用 gt_density_map (假设 spatial shape 没变，或者自动适配)
+                    # 如果 decoder 中间层 shape 不一样，这里 generate 可能会有维度问题，
+                    # 但 RT-DETR decoder 层间 shape 通常是一样的。
+
+                    indices_o2m_aux_raw = self.aux_matcher(aux_outputs, targets, gt_density_map)
+                    indices_o2m_aux = self.indices_merge(indices, indices_o2m_aux_raw)
+
+                    for loss in aux_loss_types:
+                        if loss not in self.losses: continue
+                        l_dict = self.get_loss(loss, aux_outputs, targets, indices_o2m_aux, num_boxes)
+                        # 注意命名和权重
+                        l_dict = {f"{k}_aux_{i}_o2m": v * self.weight_dict.get(k, 1.0) * aux_weight_scale for k, v
+                                  in l_dict.items()}
+                        losses.update(l_dict)
 
         # Decoder Aux Loss (Intermediate layers)
         if 'aux_outputs' in outputs:
@@ -498,8 +530,60 @@ class SetCriterion(nn.Module):
         return dn_match_indices
 
 
+def generate_density_map_gt(targets, feat_shape, device, sigma=None):  # sigma 参数设为 None 或默认值
+    B, H, W = feat_shape
+    density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
+
+    y_range = torch.arange(H, device=device)
+    x_range = torch.arange(W, device=device)
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+    grid_y = grid_y.unsqueeze(0)
+    grid_x = grid_x.unsqueeze(0)
+
+    for i in range(B):
+        if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+            continue
+
+        boxes = targets[i]['boxes']  # [N, 4]
+        N = len(boxes)
+
+        # 1. 计算自适应 Sigma
+        # 宽和高转为特征图尺度
+        w_feat = boxes[:, 2] * W
+        h_feat = boxes[:, 3] * H
+
+        # 核心公式：sigma = max(1, min(w, h) * ratio)
+        # 比如取宽高中较小值的 1/2 作为半径，再除以 3 得到 sigma (3-sigma原则)
+        # 或者直接简化为：宽高最小值的 1/3
+        # 加上 clamp(min=0.5) 防止极小目标 sigma 接近 0 导致数值异常
+        adaptive_sigmas = torch.clamp(torch.min(w_feat, h_feat) / 2.0, min=0.8)  # [N]
+        adaptive_sigmas = adaptive_sigmas.view(N, 1, 1)
+
+        # 2. 权重 (保持你原有的逻辑)
+        areas = boxes[:, 2] * boxes[:, 3]
+        scale_factor = 100.0
+        weights = 1.0 + 4.0 * torch.exp(-areas * scale_factor)
+        weights = weights.view(N, 1, 1)
+
+        # 3. 中心点
+        cx = (boxes[:, 0] * W).view(N, 1, 1)
+        cy = (boxes[:, 1] * H).view(N, 1, 1)
+
+        # 4. 计算高斯 (注意 sigma 现在是变量 [N, 1, 1])
+        dist_sq = (grid_x + 0.5 - cx) ** 2 + (grid_y + 0.5 - cy) ** 2
+
+        # 广播机制会自动处理 adaptive_sigmas
+        gaussian = torch.exp(-dist_sq / (2 * adaptive_sigmas ** 2))
+
+        weighted_gaussian = gaussian * weights
+
+        if N > 0:
+            val, _ = weighted_gaussian.max(dim=0)
+            density_map[i, 0] = val
+
+    return density_map
 # === 【新增 1】GT 生成工具函数 (加在 SetCriterion 类外面) ===
-def generate_density_map_gt(targets, feat_shape, device, sigma=2.0):
+def generate_density_map_gt_2(targets, feat_shape, device, sigma=2.0):
     """
     【高性能版】生成【面积加权】的高斯密度图 GT。
     效果与 generate_density_map_gt 严格一致 (Max聚合 + 无归一化)。

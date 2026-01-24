@@ -55,11 +55,11 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', '-c', type=str, default="../configs/rtdetr/rtdetr_r50vd_6x_coco.yml")
-    parser.add_argument('--resume', '-r', type=str, default="../tools/output/rtdetr_r50vd_6x_coco/se_om/checkpoint0002.pth")
+    # parser.add_argument('--resume', '-r', type=str, default="../tools/output/rtdetr_r50vd_6x_coco/se_om/checkpoint0002.pth")
     # parser.add_argument('--resume', '-r', type=str, default="../tools/output/rtdetr_r50vd_6x_coco/small_obj/checkpoint0000.pth")
     # parser.add_argument('--resume', '-r', type=str,
     #                     default="../tools/output/rtdetr_r50vd_6x_coco/query_select/checkpoint0071.pth")
-    # parser.add_argument('--resume', '-r', type=str,)
+    parser.add_argument('--resume', '-r', type=str,)
     parser.add_argument('--tuning', '-t', type=str, )
     parser.add_argument('--test-only', action='store_true', default=False)
     parser.add_argument('--amp', action='store_true', default=False,)

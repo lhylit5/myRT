@@ -68,6 +68,8 @@ RTDETRTransformer:
   eval_idx: -1
   eval_spatial_size: [640, 640]
 
+  use_density_aux_loss: True
+
 
 use_focal_loss: True
 

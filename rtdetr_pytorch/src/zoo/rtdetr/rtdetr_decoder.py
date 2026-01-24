@@ -284,7 +284,7 @@ class TransformerDecoder(nn.Module):
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach(
             ) if self.training else inter_ref_bbox
-        # === [修改 3] 返回 O2M Logits ===
+        # === 返回 O2M Logits ===
         if self.training and len(dec_out_logits_o2m) > 0:
             return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), torch.stack(dec_out_logits_o2m)
 
@@ -315,7 +315,8 @@ class RTDETRTransformer(nn.Module):
                  eval_spatial_size=None,
                  eval_idx=-1,
                  eps=1e-2, 
-                 aux_loss=True):
+                 aux_loss=True,
+                 use_density_aux_loss=False):
 
         super(RTDETRTransformer, self).__init__()
         assert position_embed_type in ['sine', 'learned'], \
@@ -335,6 +336,7 @@ class RTDETRTransformer(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
+        self.use_density_aux_loss = use_density_aux_loss
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -375,9 +377,11 @@ class RTDETRTransformer(nn.Module):
             for _ in range(num_decoder_layers)
         ])
 
-        # === [修改 4] 定义独立的 O2M Head ===
-        # 复制主分支的分类头，作为一对多(One-to-Many)辅助分支的专用头
-        self.dec_score_head_o2m = copy.deepcopy(self.dec_score_head)
+        # === [修改 2] 仅当 use_density_aux_loss=True 时创建 O2M Head ===
+        if self.use_density_aux_loss:
+            self.dec_score_head_o2m = copy.deepcopy(self.dec_score_head)
+        else:
+            self.dec_score_head_o2m = None
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -397,9 +401,10 @@ class RTDETRTransformer(nn.Module):
             init.constant_(reg_.layers[-1].weight, 0)
             init.constant_(reg_.layers[-1].bias, 0)
 
-        # === [修改 5] 初始化 O2M Head 的 Bias ===
-        for cls_ in self.dec_score_head_o2m:
-            init.constant_(cls_.bias, bias)
+        # === [修改 3] 按需初始化 O2M Head ===
+        if self.use_density_aux_loss and self.dec_score_head_o2m is not None:
+            for cls_ in self.dec_score_head_o2m:
+                init.constant_(cls_.bias, bias)
         
         # linear_init_(self.enc_output[0])
         init.xavier_uniform_(self.enc_output[0].weight)
@@ -612,6 +617,8 @@ class RTDETRTransformer(nn.Module):
 
         target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits = \
             self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets, density_map)
+        # === [修改 4] 传入 O2M Head (仅当训练且 flag=True 时) ===
+        score_head_o2m_input = self.dec_score_head_o2m if (self.training and self.use_density_aux_loss) else None
         # decoder
         # === [修改 6] 传入 dec_score_head_o2m ===
         out_bboxes, out_logits, out_logits_o2m = self.decoder(
@@ -626,12 +633,12 @@ class RTDETRTransformer(nn.Module):
             attn_mask=attn_mask,
             samples=samples,
             dn_meta=dn_meta,
-            score_head_o2m=self.dec_score_head_o2m if self.training else None)
+            score_head_o2m=score_head_o2m_input)
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
-            # === [修改 7] 如果有 O2M 输出，同样做 DN 切分 ===
+            # === 如果有 O2M 输出，同样做 DN 切分 ===
             if out_logits_o2m is not None:
                 _, out_logits_o2m = torch.split(out_logits_o2m, dn_meta['dn_num_split'], dim=2)
 
@@ -646,14 +653,20 @@ class RTDETRTransformer(nn.Module):
                 out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
                 out['dn_meta'] = dn_meta
 
-        # === [修改 8] 封装 O2M 输出到字典 ===
-        if self.training and out_logits_o2m is not None:
-            # 使用最后一层的 O2M logits
-            # 共享 BBox (out_bboxes[-1])
+        # === [修改 5] 封装 O2M 输出 (含中间层 Aux Outputs) ===
+        if self.training and out_logits_o2m is not None and self.use_density_aux_loss:
+            # 1. 最后一层输出
             out['o2m_outputs'] = {
                 'pred_logits': out_logits_o2m[-1],
                 'pred_boxes': out_bboxes[-1]
             }
+            # 2. 中间层的 Aux Outputs (关键！)
+            if self.aux_loss:
+                # 对应 MS-DETR 的 deep supervision
+                out['o2m_outputs']['aux_outputs'] = self._set_aux_loss(
+                    out_logits_o2m[:-1],
+                    out_bboxes[:-1]  # Box 是共享的，直接用主分支
+                )
 
         return out
 
