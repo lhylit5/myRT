@@ -154,6 +154,22 @@ class CSPRepLayer(nn.Module):
         return self.conv3(x_1 + x_2)
 
 
+# 新增一个简单的引导模块
+class SemanticGuide(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        # 将特征压缩为 1 通道的 Attention Map
+        self.attn_conv = nn.Sequential(
+            nn.Conv2d(in_channels, 1, 1),
+            nn.Sigmoid()
+        )
+        # 【建议】初始化最后一层卷积的 bias，使其输出初始值较小或平稳
+        # 这里初始化为 0，Sigmoid(0)=0.5，初始增强倍率为 1.5 倍
+        # 也可以初始化 bias 为 -3 或 -4，让初始增强接近 1.0 (Identity)，更稳妥
+        nn.init.constant_(self.attn_conv[0].bias, -3.0)
+        nn.init.normal_(self.attn_conv[0].weight, std=0.01)
+    def forward(self, x):
+        return self.attn_conv(x)
 # transformer
 class TransformerEncoderLayer(nn.Module):
     def __init__(self,
@@ -240,7 +256,8 @@ class HybridEncoder(nn.Module):
                  depth_mult=1.0,
                  act='silu',
                  level_filter_ratio: Tuple = (0.5, 0.75, 1.0),
-                 eval_spatial_size=None):
+                 eval_spatial_size=None,
+                 use_semantic_guide=False):
         super().__init__()
         self.small_object_enhance = small_object_enhance  # 保存配置
         # self.small_enhance = small_enhance
@@ -251,6 +268,7 @@ class HybridEncoder(nn.Module):
         self.num_encoder_layers = num_encoder_layers
         self.pe_temperature = pe_temperature
         self.eval_spatial_size = eval_spatial_size
+        self.use_semantic_guide = use_semantic_guide
 
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
@@ -276,6 +294,13 @@ class HybridEncoder(nn.Module):
         self.encoder = nn.ModuleList([
             TransformerEncoder(copy.deepcopy(encoder_layer), num_encoder_layers) for _ in range(len(use_encoder_idx))
         ])
+
+        # === [修改] 初始化 Semantic Guides ===
+        if self.use_semantic_guide:
+            self.semantic_guides = nn.ModuleList()
+            # 从顶层往下，每一层融合都需要一个 Guide (共 len-1 个)
+            for _ in range(len(in_channels) - 1):
+                self.semantic_guides.append(SemanticGuide(hidden_dim))
 
         # top-down fpn
         self.lateral_convs = nn.ModuleList()
@@ -365,11 +390,30 @@ class HybridEncoder(nn.Module):
         for idx in range(len(self.in_channels) - 1, 0, -1):
             feat_high = inner_outs[0]
             feat_low = proj_feats[idx - 1]
-            feat_high = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_high)
-            inner_outs[0] = feat_high
-            upsample_feat = F.interpolate(feat_high, scale_factor=2., mode='nearest')
-            inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
+
+            # 1. Lateral Conv on High feature
+            feat_high_projected = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_high)
+            # 2. [新增逻辑] 语义引导 (Semantic Guide)
+            if self.use_semantic_guide:
+                # 获取对应的 Guide 模块
+                guide_module = self.semantic_guides[len(self.in_channels) - 1 - idx]
+                # 使用 feat_high (原始的高层语义) 生成 Attention Map
+                guide_map = guide_module(feat_high)
+
+                # 上采样 Guide Map 到 feat_low 的分辨率
+                # feat_low 是 proj_feats[idx-1]，其分辨率是 feat_high 的 2 倍
+                guide_up = F.interpolate(guide_map, scale_factor=2., mode='bilinear', align_corners=False)
+
+                # 使用 Residual 方式增强 feat_low: low = low * (1 + guide)
+                feat_low = feat_low * (1.0 + guide_up)
+
+            # 更新 inner_outs[0] 为投影后的特征 (用于下一次循环作为 high feature)
+            inner_outs[0] = feat_high_projected
+
+            upsample_feat = F.interpolate(feat_high_projected, scale_factor=2., mode='nearest')
+            inner_out = self.fpn_blocks[len(self.in_channels) - 1 - idx](torch.concat([upsample_feat, feat_low], dim=1))
             inner_outs.insert(0, inner_out)
+
 
         B, C, H, W = inner_outs[0].shape
         out_reshaped = inner_outs[0].view(B, C, H * W).permute(0, 2, 1).reshape(B, H * W, C)

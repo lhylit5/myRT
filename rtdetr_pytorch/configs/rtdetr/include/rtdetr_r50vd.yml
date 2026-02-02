@@ -9,7 +9,7 @@ RTDETR:
   backbone: PResNet
   encoder: HybridEncoder
   decoder: RTDETRTransformer
-  use_density_query_selection: False
+  use_density_query_selection: True
   multi_scale: [480, 512, 544, 576, 608, 640, 640, 640, 672, 704, 736, 768, 800]
 
 PResNet:
@@ -40,6 +40,7 @@ HybridEncoder:
   depth_mult: 1
   act: 'silu'
 
+  use_semantic_guide: False
   # eval
   eval_spatial_size: [640, 640]
 
@@ -68,7 +69,7 @@ RTDETRTransformer:
   eval_idx: -1
   eval_spatial_size: [640, 640]
 
-  use_density_aux_loss: True
+  use_density_aux_loss: False
 
 
 use_focal_loss: True
@@ -83,7 +84,7 @@ SetCriterion:
   alpha: 0.75
   gamma: 2.0
 
-  use_density_aux_loss: True
+  use_density_aux_loss: False
 
   matcher:
     type: HungarianMatcher

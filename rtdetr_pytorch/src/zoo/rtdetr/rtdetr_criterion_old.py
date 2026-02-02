@@ -669,52 +669,52 @@ def generate_density_map_gt(targets, feat_shape, device, sigma=2.0):
             density_map[i, 0] = val
 
     return density_map
-# def generate_density_map_gt(targets, feat_shape, device, sigma=2.0):
-#     """
-#     生成【面积加权】的高斯密度图 GT。
-#     面积越小的物体，其高斯热图的峰值权重越高。
-#     """
-#     B, H, W = feat_shape
-#     density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
-#
-#     # 坐标网格
-#     y_range = torch.arange(H, device=device)
-#     x_range = torch.arange(W, device=device)
-#     grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
-#
-#     for i in range(B):
-#         if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
-#             continue
-#
-#         boxes = targets[i]['boxes']  # [N, 4] (cx, cy, w, h)
-#
-#         # === 核心修改：计算面积权重 ===
-#         # w, h 是归一化的 (0~1)。面积 area = w * h
-#         areas = boxes[:, 2] * boxes[:, 3]
-#
-#         # 加权公式：weight = 1 + alpha * exp(-beta * area)
-#         # 这里的参数经过调优，能让极小目标权重达到 5.0，大目标维持在 1.0
-#         # 你可以根据数据集微调 scale_factor (beta)
-#         scale_factor = 100.0
-#         weights = 1.0 + 4.0 * torch.exp(-areas * scale_factor)
-#
-#         # 归一化坐标转特征图绝对坐标
-#         cx = boxes[:, 0] * W
-#         cy = boxes[:, 1] * H
-#
-#         # 逐个目标生成高斯并加权
-#         # (注：此处为了代码清晰使用了循环，N 通常不大，训练耗时可忽略)
-#         for j in range(len(boxes)):
-#             dist_sq = (grid_x - cx[j]) ** 2 + (grid_y - cy[j]) ** 2
-#             gaussian = torch.exp(-dist_sq / (2 * sigma ** 2))
-#
-#             # 应用权重！
-#             weighted_gaussian = gaussian * weights[j]
-#
-#             # 使用 Max 融合 (保留局部最强响应)
-#             density_map[i, 0] = torch.maximum(density_map[i, 0], weighted_gaussian)
-#
-#     return density_map
+def generate_density_map_gt(targets, feat_shape, device, sigma=2.0):
+    """
+    生成【面积加权】的高斯密度图 GT。
+    面积越小的物体，其高斯热图的峰值权重越高。
+    """
+    B, H, W = feat_shape
+    density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
+
+    # 坐标网格
+    y_range = torch.arange(H, device=device)
+    x_range = torch.arange(W, device=device)
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+
+    for i in range(B):
+        if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+            continue
+
+        boxes = targets[i]['boxes']  # [N, 4] (cx, cy, w, h)
+
+        # === 核心修改：计算面积权重 ===
+        # w, h 是归一化的 (0~1)。面积 area = w * h
+        areas = boxes[:, 2] * boxes[:, 3]
+
+        # 加权公式：weight = 1 + alpha * exp(-beta * area)
+        # 这里的参数经过调优，能让极小目标权重达到 5.0，大目标维持在 1.0
+        # 你可以根据数据集微调 scale_factor (beta)
+        scale_factor = 100.0
+        weights = 1.0 + 4.0 * torch.exp(-areas * scale_factor)
+
+        # 归一化坐标转特征图绝对坐标
+        cx = boxes[:, 0] * W
+        cy = boxes[:, 1] * H
+
+        # 逐个目标生成高斯并加权
+        # (注：此处为了代码清晰使用了循环，N 通常不大，训练耗时可忽略)
+        for j in range(len(boxes)):
+            dist_sq = (grid_x - cx[j]) ** 2 + (grid_y - cy[j]) ** 2
+            gaussian = torch.exp(-dist_sq / (2 * sigma ** 2))
+
+            # 应用权重！
+            weighted_gaussian = gaussian * weights[j]
+
+            # 使用 Max 融合 (保留局部最强响应)
+            density_map[i, 0] = torch.maximum(density_map[i, 0], weighted_gaussian)
+
+    return density_map
 # def generate_density_map_gt(targets, feat_shape, device, sigma=2.0):
 #     """
 #     targets: list[dict], 每个 dict 包含 'boxes' (N, 4) [cx, cy, w, h] 归一化坐标

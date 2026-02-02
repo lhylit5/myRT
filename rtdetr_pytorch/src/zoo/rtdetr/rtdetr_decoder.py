@@ -520,45 +520,65 @@ class RTDETRTransformer(nn.Module):
         # === 创新点二核心逻辑：基于密度的 Query 选择 ===
         # ====================================================================================
         if density_map is not None:
-            # density_map 来自 S3 层: [B, 1, H3, W3]
-            # 1. 获取 S3 层的 Anchor 数量
-            # spatial_shapes[0] 是 S3 的 (H, W)，通常是 [80, 80]
-            num_s3_anchors = spatial_shapes[0][0] * spatial_shapes[0][1]
+            # density_map: [B, 1, H3, W3] (来自 SmallObjectEnhance, Stride=8)
 
-            # 2. 展平密度图: [B, 1, H3, W3] -> [B, H3*W3, 1]
-            density_score_s3 = density_map.flatten(2).permute(0, 2, 1)
+            # 1. 归一化密度图
+            # 如果密度头输出是 ReLU (0~inf)，建议先 Sigmoid 压到 (0.5~1.0) 或 (0~1) 之间
+            # 方案 A (推荐): 对数变换，保留相对优势，抑制过大异常值
+            density_map_norm = torch.log1p(density_map)
 
-            # 3. 构建全尺度密度分数 (S3+S4+S5)
-            # 初始化全为 0，大小匹配 total_anchors
-            total_anchors = enc_outputs_class.shape[1]
-            full_density_score = torch.zeros(
-                (bs, total_anchors, 1),
-                device=enc_outputs_class.device,
-                dtype=enc_outputs_class.dtype
-            )
+            density_scores_list = []
 
-            # 4. 仅填充 S3 部分 (假设 S3 是第一个拼接的特征，RT-DETR 默认如此)
-            if total_anchors >= num_s3_anchors:
-                full_density_score[:, :num_s3_anchors, :] = density_score_s3
+            # 2. 遍历每个特征层级 (S3, S4, S5)，生成对应的密度分数
+            # spatial_shapes 通常是 [[H3, W3], [H4, W4], [H5, W5]]
+            # RT-DETR 的 Anchor 生成顺序严格对应 spatial_shapes 的顺序
+            for i, (h, w) in enumerate(spatial_shapes):
+                if i == 0:
+                    # S3 层：直接使用原始密度图
+                    d_map = density_map_norm
+                else:
+                    # S4/S5 层：对 S3 密度图进行下采样
+                    # 这里的 h, w 是当前层的尺寸。使用 interpolate 确保尺寸严格匹配
+                    d_map = F.interpolate(
+                        density_map_norm,
+                        size=(h, w),
+                        mode='bilinear',
+                        align_corners=False
+                    )
 
-                # 5. 融合分数
-                # 先将 logits 转为概率 (0~1)
-                enc_probs = enc_outputs_class.sigmoid()
-                # 取每个 Anchor 最大类别的概率
-                topk_score_cls = enc_probs.max(-1).values  # [B, Total_Anchors]
+                # 展平: [B, 1, H, W] -> [B, H*W, 1]
+                d_score = d_map.flatten(2).permute(0, 2, 1)
+                density_scores_list.append(d_score)
 
-                # 融合公式：分类概率 + 密度分数
-                # 密度分数在小目标区域经过面积加权后很大(>1)，能显著提升其排名
-                alpha = 0.1
-                mixed_score = topk_score_cls + alpha * full_density_score.squeeze(-1)
+            # 3. 拼接所有层的密度分数，形成全尺度密度向量
+            # Shape: [B, Total_Anchors, 1]
+            full_density_score = torch.cat(density_scores_list, dim=1)
 
-                # 6. 根据融合分数选 Top-K 索引
-                _, topk_ind = torch.topk(mixed_score, self.num_queries, dim=1)
-            else:
-                # 异常回退（理论上不会发生）
-                _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
+            # 4. 安全检查：确保拼接后的长度与 Anchor 总数一致
+            if full_density_score.shape[1] != enc_outputs_class.shape[1]:
+                # 极少数情况可能出现 shape 不对齐，做个截断或补零的保护（通常不需要）
+                # print(f"Warning: Density score shape mismatch. Expected {enc_outputs_class.shape[1]}, got {full_density_score.shape[1]}")
+                full_density_score = F.interpolate(
+                    full_density_score.permute(0, 2, 1),
+                    size=enc_outputs_class.shape[1],
+                    mode='nearest'
+                ).permute(0, 2, 1)
+
+            # 5. 融合分数 (乘法门控)
+            # 原始分类概率
+            enc_probs = enc_outputs_class.sigmoid()
+            topk_score_cls = enc_probs.max(-1).values  # [B, Total_Anchors]
+
+            # 融合: Score = Cls_Score * (1 + alpha * Density_Score)
+            # 这样既保留了原来的分类置信度，又让高密度区域的 Anchor 更容易入选
+            alpha = 0.5 # 建议调大一点，因为 sigmoid 后值在 0~1 之间
+            mixed_score = topk_score_cls * (1.0 + alpha * full_density_score.squeeze(-1))
+
+            # 6. 选 Top-K
+            _, topk_ind = torch.topk(mixed_score, self.num_queries, dim=1)
+
         else:
-            # 原版逻辑：仅根据分类分数选 Top-K
+            # 原版逻辑
             _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
         
         reference_points_unact = enc_outputs_coord_unact.gather(dim=1, \
