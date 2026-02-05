@@ -21,14 +21,12 @@ from .visualize import visualize_boxes
 class RTDETR(nn.Module):
     __inject__ = ['backbone', 'encoder', 'decoder', ]
 
-    def __init__(self, backbone: nn.Module, encoder, decoder, multi_scale=None, use_density_query_selection=False):
+    def __init__(self, backbone: nn.Module, encoder, decoder, multi_scale=None):
         super().__init__()
         self.backbone = backbone
         self.decoder = decoder
         self.encoder = encoder
         self.multi_scale = multi_scale
-        # 保存开关状态
-        self.use_density_query_selection = use_density_query_selection
         
     def forward(self, x, targets=None):
         samples = []
@@ -59,8 +57,7 @@ class RTDETR(nn.Module):
         x_enc, pred_density_map, feat_before, feat_after = self.encoder(x)
         # 2. 将密度图传给 decoder (仅当开关开启且有密度图时)
         # 注意：你需要修改 Decoder 的 forward 签名来接收这个参数
-        density_map_for_decoder = pred_density_map if self.use_density_query_selection else None
-        x = self.decoder(x_enc, samples, targets, density_map=density_map_for_decoder)
+        x = self.decoder(x_enc, samples, targets, density_map=pred_density_map)
         # === 【新增】将密度图加入输出字典 ===
         # 只有在训练阶段且密度图存在时才需要加入
         if pred_density_map is not None:

@@ -1,6 +1,3 @@
-# src/zoo/rtdetr/small_enhance.py
-# 小目标信息增强（基于 DQ-DETR 风格）
-# 优化点：调整通道数减少计算量；修复 ConvSimple 缺失 Bias 问题
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,217 +11,149 @@ except Exception:
 __all__ = ['SmallObjectEnhance']
 
 
-# ----------------------------
-# Conv + BN + ReLU（DQ-DETR 风格）
-# ----------------------------
-class Conv_BN(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size, stride=1,
-                 padding=0, dilation=1, groups=1, relu=True, bn=True, bias=False):
-        super(Conv_BN, self).__init__()
-        self.conv = nn.Conv2d(in_channel, out_channel, kernel_size=kernel_size,
-                              stride=stride, padding=padding, dilation=dilation,
-                              groups=groups, bias=bias)
-        self.bn = nn.BatchNorm2d(out_channel, eps=1e-5, momentum=0.01, affine=True) if bn else None
-        self.relu = nn.ReLU(inplace=True) if relu else None
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        # 1. X方向和Y方向的自适应池化
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        # 2. 共享的 1x1 卷积变换
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+
+        # 3. 分别恢复通道
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
-        x = self.conv(x)
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
-        return x
+        identity = x
+        n, c, h, w = x.size()
+
+        # X轴和Y轴分解
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        # 拼接处理 (利用通道相关性)
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        # 分离
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        # 生成注意力权重
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        # 双向加权
+        out = identity * a_h * a_w
+        return out
 
 
-# ----------------------------
-# 基础 Conv（不含归一化），用于 CCM 等
-# 修正：默认 bias=True，因为没有 BN
-# ----------------------------
-class ConvSimple(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1,
-                 dilation=1, relu=True, bias=True):
+
+class DynamicCCM(nn.Module):
+    def __init__(self, in_channel, mid_channel, out_channel, dilation_list=[1, 2, 4]):
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size,
-                              stride=stride, padding=padding, dilation=dilation,
-                              bias=bias)
-        self.relu = nn.ReLU(inplace=True) if relu else None
+        self.mid_channel = mid_channel
 
-    def forward(self, x):
-        x = self.conv(x)
-        if self.relu is not None:
-            x = self.relu(x)
-        return x
-
-
-# ----------------------------
-# ChannelPool (max + mean)
-# ----------------------------
-class ChannelPool(nn.Module):
-    def forward(self, x):
-        return torch.cat((torch.max(x, 1)[0].unsqueeze(1),
-                          torch.mean(x, 1).unsqueeze(1)), dim=1)
-
-
-# ----------------------------
-# SpatialGate：compress -> Conv_BN -> sigmoid
-# ----------------------------
-class SpatialGate(nn.Module):
-    def __init__(self, kernel_size=7, use_bn=True):
-        super().__init__()
-        pad = (kernel_size - 1) // 2
-        self.compress = ChannelPool()
-        # 注意：这里 Conv_BN 的 bias 设为 False 是可以的，因为后面接了 BN (如果 use_bn=True)
-        # 如果 use_bn=False，Conv_BN 内部逻辑需要处理 bias。
-        # 为保险起见，我们让 Conv_BN 内部处理：如果 bn=False，建议 bias=True。
-        # 这里为了简单，保持你的原逻辑，但在 SpatialGate 这种attention生成中，bias影响不大。
-        self.spatial = Conv_BN(2, 1, kernel_size=kernel_size, stride=1, padding=pad, relu=False, bn=use_bn,
-                               bias=not use_bn)
-
-    def forward(self, x):
-        x_comp = self.compress(x)  # [B,2,H,W]
-        x_out = self.spatial(x_comp)  # [B,1,H,W]
-        return torch.sigmoid(x_out)
-
-
-# ----------------------------
-# ChannelGate: MLP
-# ----------------------------
-class Flatten(nn.Module):
-    def forward(self, x):
-        return x.view(x.size(0), -1)
-
-
-class ChannelGate(nn.Module):
-    def __init__(self, gate_channels, reduction_ratio=16, pool_types=['avg', 'max']):
-        super().__init__()
-        self.gate_channels = gate_channels
-        inner = max(1, gate_channels // reduction_ratio)
-        self.mlp = nn.Sequential(
-            Flatten(),
-            nn.Linear(gate_channels, inner),
-            nn.ReLU(inplace=True),
-            nn.Linear(inner, gate_channels)
+        # 1x1 降维/映射
+        self.conv_in = nn.Sequential(
+            nn.Conv2d(in_channel, mid_channel, 1, bias=False),
+            nn.BatchNorm2d(mid_channel),
+            nn.ReLU(inplace=True)
         )
-        self.pool_types = list(pool_types)
+
+        # 并行多分支 (Multi-Branch)
+        self.branches = nn.ModuleList()
+        for d in dilation_list:
+            self.branches.append(nn.Sequential(
+                nn.Conv2d(mid_channel, mid_channel, 3, padding=d, dilation=d, bias=False),
+                nn.BatchNorm2d(mid_channel),
+                nn.ReLU(inplace=True)
+            ))
+
+        # 注意力融合层 (Selection Mechanism)
+        # 输入: GlobalAvgPool(Sum(Branches)) -> FC -> Softmax -> Weights
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(mid_channel, max(mid_channel // 16, 32), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(mid_channel // 16, 32), len(dilation_list) * mid_channel, bias=False)
+        )
+        self.softmax = nn.Softmax(dim=1)
+        # 输出层
+        self.conv_out = nn.Sequential(
+            nn.Conv2d(mid_channel, out_channel, 1, bias=False),
+            nn.BatchNorm2d(out_channel),  # 这里加了BN更稳，也可以去掉保持你原来的风格
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x):
-        channel_att_sum = None
-        for pool_type in self.pool_types:
-            if pool_type == 'avg':
-                # 显式指定 dim，防止 warning
-                avg_pool = F.avg_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
-                channel_att_raw = self.mlp(avg_pool)
-            elif pool_type == 'max':
-                max_pool = F.max_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))
-                channel_att_raw = self.mlp(max_pool)
-            else:
-                continue
+        b, c, h, w = x.shape
+        x_mid = self.conv_in(x)
 
-            if channel_att_sum is None:
-                channel_att_sum = channel_att_raw
-            else:
-                channel_att_sum = channel_att_sum + channel_att_raw
+        # 1. 计算各分支特征
+        feats = [branch(x_mid) for branch in self.branches]  # List of [B, C, H, W]
+        feats_stack = torch.stack(feats, dim=1)  # [B, 3, C, H, W]
 
-        scale = torch.sigmoid(channel_att_sum).unsqueeze(2).unsqueeze(3).expand_as(x)
-        return scale
+        # 2. 融合引导 (SKNet 思想: U = Sum(Branches))
+        U = torch.sum(feats_stack, dim=1)  # [B, C, H, W]
+
+        # 3. 生成通道级选择权重
+        S = self.avg_pool(U).view(b, -1)  # [B, C]
+        Z = self.fc(S)  # [B, 3*C]
+
+        # Reshape to [B, 3, C]
+        weights = Z.view(b, len(self.branches), self.mid_channel)
+        weights = self.softmax(weights).unsqueeze(-1).unsqueeze(-1)  # [B, 3, C, 1, 1]
+
+        V = torch.sum(feats_stack * weights, dim=1)  # [B, C, H, W]
+
+        return self.conv_out(V)
 
 
-# ----------------------------
-# SmallObjectEnhance（主类）
-# ----------------------------
 @register
 class SmallObjectEnhance(nn.Module):
-    def __init__(self,
-                 in_ch=256,
-                 mid_ch=256,  # [优化] 默认为 256，原 512 太重
-                 ccm_cfg=(256, 256, 256, 256),  # [优化] 默认为 256，保持与 RT-DETR hidden_dim 一致
-                 dilation=2,
-                 use_aux=False,
-                 reduction_ratio=16,
-                 pool_types=['avg', 'max'],
-                 use_bn=True,
-                 use_feature_enhance=True):
-        """
-        in_ch: 输入特征通道（通常 256）
-        mid_ch: 1x1 映射通道。建议设为 256 以保持轻量。
-        ccm_cfg: CCM 序列配置。
-        """
+    def __init__(self, in_ch=256, mid_ch=512, out_ch=256, use_feature_enhance=True):
         super().__init__()
-        self.in_ch = in_ch
-        self.mid_ch = mid_ch
-        self.use_aux = use_aux
         self.use_feature_enhance = use_feature_enhance
 
-        # 1x1 映射（不含归一化，bias=True）
-        self.conv1 = ConvSimple(in_ch, mid_ch, kernel_size=1, padding=0, relu=True, bias=True)
 
-        # CCM（膨胀卷积序列）
-        # [重要] 移除了 BN，所以 bias 必须为 True，否则卷积无法学习偏移量
-        layers = []
-        in_c = mid_ch
-        for out_c in ccm_cfg:
-            layers.append(
-                ConvSimple(in_c, out_c, kernel_size=3, padding=dilation, dilation=dilation, relu=True, bias=True))
-            in_c = out_c
-        self.ccm = nn.Sequential(*layers)
-        self.ccm_out_ch = ccm_cfg[-1]
+        self.dynamic_ccm = DynamicCCM(in_ch, mid_ch, out_ch, dilation_list=[1, 2, 4])
 
-        # === 密度图预测头 ===
-        # 输出 1 通道密度图
-        self.density_head = nn.Conv2d(self.ccm_out_ch, 1, kernel_size=1, bias=True)  # 建议 bias=True
+        self.coord_att = CoordAtt(out_ch, out_ch)
+
+        # 密度图预测头
+        self.density_head = nn.Conv2d(out_ch, 1, 1)
         self.relu = nn.ReLU(inplace=True)
 
-        if self.use_feature_enhance:
-            # 空间与通道门
-            self.spatial_gate = SpatialGate(kernel_size=7, use_bn=use_bn)
-            self.channel_gate = ChannelGate(self.ccm_out_ch, reduction_ratio=reduction_ratio, pool_types=pool_types)
-
-            # [优化] 初始化为 0，让训练初期保持恒等映射，避免干扰 Backbone 特征
-            self.alpha = nn.Parameter(torch.zeros(1))
+        # 可学习系数 (保持你的风格，初始化为 1.0)
+        self.alpha = nn.Parameter(torch.zeros(1))
 
     def forward(self, feats):
-        # RT-DETR 传入的是 list[Tensor]
         if not isinstance(feats, (list, tuple)):
             raise ValueError("feats must be list/tuple")
 
-        S = feats[0]  # S3 feature, [B, 256, H, W]
-        B, C0, H, W = S.shape
+        S = feats[0]  # S3 Feature [B, 256, H, W]
 
-        # 1. 生成上下文特征 Fc
-        v = self.conv1(S)  # [B, mid_ch, H, W]
-        Fc = self.ccm(v)  # [B, ccm_out_ch, H, W]
+        Fc = self.dynamic_ccm(S)  # [B, 256, H, W]
 
-        # 2. 生成预测密度图 (用于 Loss 计算)
-        pred_density_map = self.relu(self.density_head(Fc))  # [B, 1, H, W]
+        # 2. 生成密度图 (用于 Loss)
+        pred_density_map = self.relu(self.density_head(Fc))
 
-        # 3. 特征增强
+        # 3. 特征增强 (Coordinate Attention)
         enhanced_S = S
         if self.use_feature_enhance:
-            # 空间注意力 (Spatial Attention)
-            Ws = self.spatial_gate(Fc)  # [B,1,H,W]
-            # 上采样 Mask (通常 CCM 不改变分辨率，但以防万一)
-            if Ws.shape[2:] != (H, W):
-                mask_for_S = F.interpolate(Ws, size=(H, W), mode='bilinear', align_corners=False)
-            else:
-                mask_for_S = Ws
 
-            # 残差增强: S * (1 + alpha * mask)
-            enhanced_S = S * (1.0 + self.alpha * mask_for_S)
+            att_mask = self.coord_att(Fc)
+            enhanced_S = S * (1.0 + self.alpha * att_mask)
 
-            # 通道注意力 (Channel Attention)
-            # 假设 Fc 和 S 通道数一致 (均为 256)，则可以直接加权
-            # 如果不一致 (mid_ch=512)，Wc 维度是 512，无法直接乘 S(256)
-            Wc = self.channel_gate(Fc)  # [B, ccm_out_ch, 1, 1]
-
-            if Wc.size(1) == C0:
-                enhanced_S = enhanced_S * Wc
-            else:
-                # 维度不匹配时的 fallback：取均值作为全局 scalar 缩放
-                # 这是一个保护措施，防止 mid_ch != in_ch 时报错
-                enhanced_S = enhanced_S * Wc.mean(dim=1, keepdim=True)
-
-        # 替换原 S3 特征
         out_feats = list(feats)
         out_feats[0] = enhanced_S
-
         return out_feats, pred_density_map

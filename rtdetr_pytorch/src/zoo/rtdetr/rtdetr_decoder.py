@@ -316,7 +316,9 @@ class RTDETRTransformer(nn.Module):
                  eval_idx=-1,
                  eps=1e-2, 
                  aux_loss=True,
-                 use_density_aux_loss=False):
+                 use_density_query_selection=False,
+                 use_density_aux_loss=False,
+                 density_weight_init=None):
 
         super(RTDETRTransformer, self).__init__()
         assert position_embed_type in ['sine', 'learned'], \
@@ -336,7 +338,14 @@ class RTDETRTransformer(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
+        self.use_density_query_selection = use_density_query_selection
         self.use_density_aux_loss = use_density_aux_loss
+
+        # === [新增] 定义层级密度权重为可学习参数 ===
+        # 初始化为 [1.0, 0.1, 0.1]，对应 S3, S4, S5
+        # 这样网络初始状态会偏向 S3，但后续可以自动调整 S4/S5 的重要性
+        if self.use_density_query_selection:
+            self.level_density_scales = nn.Parameter(torch.tensor(density_weight_init, dtype=torch.float32))
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -519,68 +528,65 @@ class RTDETRTransformer(nn.Module):
         # ====================================================================================
         # === 创新点二核心逻辑：基于密度的 Query 选择 ===
         # ====================================================================================
-        if density_map is not None:
-            # density_map: [B, 1, H3, W3] (来自 SmallObjectEnhance, Stride=8)
+        if self.use_density_query_selection:
+            # 1. 计算 Warm-up Alpha
+            # 策略：前 4 个 epoch (0-3) 为 0，之后线性增加到 0.5
+            target_alpha = 0.8
+            warmup_epochs = 4
 
-            # 1. 归一化密度图
-            # 如果密度头输出是 ReLU (0~inf)，建议先 Sigmoid 压到 (0.5~1.0) 或 (0~1) 之间
-            # 方案 A (推荐): 对数变换，保留相对优势，抑制过大异常值
-            density_map_norm = torch.log1p(density_map)
+            # if self.training:
+            #     if epoch < warmup_epochs:
+            #         current_alpha = 0.0
+            #     else:
+            #         # 从第 4 个 epoch 开始，每个 epoch 增加 0.1，直到 0.5
+            #         current_alpha = min(target_alpha, (epoch - warmup_epochs + 1) * 0.1)
+            # else:
+            #     current_alpha = target_alpha
+            current_alpha = target_alpha
+            # 2. 归一化密度图 (因为 GT 最大值约 5.0，这里归一化到 ~1.0)
+            density_map_norm = density_map / 5.0
 
             density_scores_list = []
 
-            # 2. 遍历每个特征层级 (S3, S4, S5)，生成对应的密度分数
-            # spatial_shapes 通常是 [[H3, W3], [H4, W4], [H5, W5]]
-            # RT-DETR 的 Anchor 生成顺序严格对应 spatial_shapes 的顺序
+            # === [核心修改] 使用可学习权重 ===
+            # 取绝对值确保权重为正 (物理上密度是“加分项”)
+            learnable_scales = self.level_density_scales.abs()
+
             for i, (h, w) in enumerate(spatial_shapes):
-                if i == 0:
-                    # S3 层：直接使用原始密度图
-                    d_map = density_map_norm
-                else:
-                    # S4/S5 层：对 S3 密度图进行下采样
-                    # 这里的 h, w 是当前层的尺寸。使用 interpolate 确保尺寸严格匹配
-                    d_map = F.interpolate(
-                        density_map_norm,
-                        size=(h, w),
-                        mode='bilinear',
-                        align_corners=False
-                    )
+                # 获取当前层的可学习权重
+                # i=0 -> S3 (init 1.0), i=1 -> S4 (init 0.1), i=2 -> S5 (init 0.1)
+                scale_weight = learnable_scales[i]
 
-                # 展平: [B, 1, H, W] -> [B, H*W, 1]
+                # 统一使用 AvgPool 下采样 (对 S3 来说是 Identity，对 S4/S5 是下采样)
+                d_map = F.adaptive_avg_pool2d(density_map_norm, (h, w))
+
+                # 展平并加权
                 d_score = d_map.flatten(2).permute(0, 2, 1)
-                density_scores_list.append(d_score)
+                density_scores_list.append(d_score * scale_weight)
 
-            # 3. 拼接所有层的密度分数，形成全尺度密度向量
-            # Shape: [B, Total_Anchors, 1]
+            # 拼接全尺度密度分数
             full_density_score = torch.cat(density_scores_list, dim=1)
+            if valid_mask is not None:
+                full_density_score = full_density_score * valid_mask.to(full_density_score.dtype)
 
-            # 4. 安全检查：确保拼接后的长度与 Anchor 总数一致
-            if full_density_score.shape[1] != enc_outputs_class.shape[1]:
-                # 极少数情况可能出现 shape 不对齐，做个截断或补零的保护（通常不需要）
-                # print(f"Warning: Density score shape mismatch. Expected {enc_outputs_class.shape[1]}, got {full_density_score.shape[1]}")
-                full_density_score = F.interpolate(
-                    full_density_score.permute(0, 2, 1),
-                    size=enc_outputs_class.shape[1],
-                    mode='nearest'
-                ).permute(0, 2, 1)
 
-            # 5. 融合分数 (乘法门控)
-            # 原始分类概率
-            enc_probs = enc_outputs_class.sigmoid()
-            topk_score_cls = enc_probs.max(-1).values  # [B, Total_Anchors]
+            # 4. 融合分数 (加法融合)
+            # 仅当 alpha > 0 时才进行计算，节省推理开销
+            if current_alpha > 0:
+                enc_probs = enc_outputs_class.sigmoid()
+                topk_score_cls = enc_probs.max(-1).values
 
-            # 融合: Score = Cls_Score * (1 + alpha * Density_Score)
-            # 这样既保留了原来的分类置信度，又让高密度区域的 Anchor 更容易入选
-            alpha = 0.5 # 建议调大一点，因为 sigmoid 后值在 0~1 之间
-            mixed_score = topk_score_cls * (1.0 + alpha * full_density_score.squeeze(-1))
+                # 融合公式：分类分 + (当前Epoch权重 * 层级衰减后的密度分)
+                mixed_score = topk_score_cls + current_alpha * full_density_score.squeeze(-1)
 
-            # 6. 选 Top-K
-            _, topk_ind = torch.topk(mixed_score, self.num_queries, dim=1)
+                _, topk_ind = torch.topk(mixed_score, self.num_queries, dim=1)
+            else:
+                # Warm-up 期间回退到原始逻辑
+                _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
 
         else:
-            # 原版逻辑
             _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
-        
+
         reference_points_unact = enc_outputs_coord_unact.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_coord_unact.shape[-1]))
         # top300 query的cx,cy,w,h

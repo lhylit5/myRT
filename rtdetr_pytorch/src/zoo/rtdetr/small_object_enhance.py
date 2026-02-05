@@ -157,20 +157,20 @@ class SmallObjectEnhance(nn.Module):
         self.use_aux = use_aux
         self.use_feature_enhance = use_feature_enhance
         # 1x1 映射（不含归一化）
-        self.conv1 = ConvSimple(in_ch, mid_ch, kernel_size=1, padding=0, relu=True, bias=False)
+        self.conv1 = ConvSimple(in_ch, mid_ch, kernel_size=1, padding=0, relu=True, bias=True)
 
         # CCM（膨胀卷积序列），不使用归一化（保持轻量）
         layers = []
         in_c = mid_ch
         for out_c in ccm_cfg:
-            layers.append(ConvSimple(in_c, out_c, kernel_size=3, padding=dilation, dilation=dilation, relu=True, bias=False))
+            layers.append(ConvSimple(in_c, out_c, kernel_size=3, padding=dilation, dilation=dilation, relu=True, bias=True))
             in_c = out_c
         self.ccm = nn.Sequential(*layers)
         self.ccm_out_ch = ccm_cfg[-1]
 
         # === 【新增 1】密度图预测头 ===
         # 将 CCM 特征 (256ch) 映射为 密度图 (1ch)
-        self.density_head = nn.Conv2d(self.ccm_out_ch, 1, kernel_size=1, bias=False)
+        self.density_head = nn.Conv2d(self.ccm_out_ch, 1, kernel_size=1, bias=True)
         self.relu = nn.ReLU(inplace=True)
 
         # 只有在需要增强时才初始化 Attention 模块，节省参数量（或者保留但 forward 时跳过）
