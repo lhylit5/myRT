@@ -17,7 +17,7 @@ from src.core import YAMLConfig
 # 1. 配置文件路径
 CONFIG_PATH = '../configs/rtdetr/rtdetr_r50vd_6x_coco.yml'
 # 2. 模型权重路径
-CHECKPOINT_PATH = '../tools/output/rtdetr_r50vd_6x_coco/small_obj/checkpoint0071.pth'
+CHECKPOINT_PATH = '../tools/output/rtdetr_r50vd_6x_coco/query_select/checkpoint0007.pth'
 # CHECKPOINT_PATH = '../tools/output/rtdetr_r50vd_6x_coco/query_select/checkpoint0061.pth'
 # CHECKPOINT_PATH = '../tools/output/rtdetr_r50vd_6x_coco/query_select/checkpoint0061.pth'
 # 3. COCO 路径
@@ -25,12 +25,12 @@ COCO_ROOT = '../configs/dataset/coco'
 VAL_IMG_DIR = os.path.join(COCO_ROOT, 'val2017')
 VAL_ANN_FILE = os.path.join(COCO_ROOT, 'annotations/instances_val2017.json')
 # 4. 保存路径
-SAVE_DIR = "output/vis_paper_results"
+SAVE_DIR = "output/vis_density_results"
 
 # === 新增功能：指定图片 ID ===
 # 如果列表不为空，脚本将【只可视化】这些 ID 的图片 (用于论文定向截图)
 # 如果列表为空 []，脚本将【自动随机】抽取包含小目标的图片
-SPECIFIC_IMG_IDS = [139099,192670]
+SPECIFIC_IMG_IDS = []
 # 示例：SPECIFIC_IMG_IDS = [397133, 37777, 50012]
 
 # 随机模式下的采样数量

@@ -47,7 +47,7 @@ def extract_test_results(input_file, output_file):
 if __name__ == "__main__":
     # ================= 配置区域 =================
     # 输入的日志文件名 (你之前的训练日志)
-    INPUT_LOG = "E:\experiment\smallenhance_72epo\\train_areaweight.log"
+    INPUT_LOG = "E:\experiment\Base_72epo\\train.log"
 
     # 输出的日志文件名 (提取后的结果)
     OUTPUT_LOG = "test_results.log"

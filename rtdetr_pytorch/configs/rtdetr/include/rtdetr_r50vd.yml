@@ -53,7 +53,7 @@ SmallObjectEnhance:
 #  ccm_cfg: [512, 512, 256, 256]
 #  dilation: 2
 #  use_bn: True
-  use_feature_enhance: True
+  use_feature_enhance: False
 
 RTDETRTransformer:
   feat_channels: [256, 256, 256]
@@ -69,7 +69,7 @@ RTDETRTransformer:
   eval_idx: -1
   eval_spatial_size: [640, 640]
 
-  use_density_query_selection: False
+  use_density_query_selection: True
   density_weight_init: [1.0, 0.3, 0.1]
 
   use_density_aux_loss: False
@@ -83,7 +83,7 @@ RTDETRPostProcessor:
 
 
 SetCriterion:
-  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_density: 4.0}
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_density: 2}
   losses: ['vfl', 'boxes', 'density']
   alpha: 0.75
   gamma: 2.0

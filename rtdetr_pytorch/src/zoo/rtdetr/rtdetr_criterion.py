@@ -5,12 +5,11 @@ https://github.com/facebookresearch/detr/blob/main/models/detr.py
 by lyuwenyu
 """
 
-
-import torch 
-import torch.nn as nn 
-import torch.nn.functional as F 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
-
+import torch.distributed as dist
 # from torchvision.ops import box_convert, generalized_box_iou
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 
@@ -149,6 +148,27 @@ class DensityGuidedMatcher(nn.Module):
 
         return indices
 
+
+# === 辅助函数：处理多卡归一化 ===
+def get_world_size():
+    if not dist.is_available(): return 1
+    if not dist.is_initialized(): return 1
+    return dist.get_world_size()
+
+
+def reduce_mean(tensor):
+    """
+    多卡同步：将所有卡上的 tensor 求和，然后除以 GPU 数量。
+    用于 Loss 的同步，或者统计数量。
+    """
+    world_size = get_world_size()
+    if world_size < 2:
+        return tensor
+    with torch.no_grad():
+        dist.all_reduce(tensor)  # 默认是 Sum 操作
+        return tensor / world_size
+
+
 @register
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
@@ -159,7 +179,8 @@ class SetCriterion(nn.Module):
     __share__ = ['num_classes', ]
     __inject__ = ['matcher', ]
 
-    def __init__(self, matcher, weight_dict, losses, alpha=0.2, gamma=2.0, eos_coef=1e-4, num_classes=80, use_density_aux_loss=False):
+    def __init__(self, matcher, weight_dict, losses, alpha=0.2, gamma=2.0, eos_coef=1e-4, num_classes=80,
+                 use_density_aux_loss=False):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -187,8 +208,247 @@ class SetCriterion(nn.Module):
         # 初始化辅助匹配器
         self.aux_matcher = DensityGuidedMatcher(weight_dict, alpha, gamma)
 
+    def loss_density3(self, outputs, targets, indices, num_boxes, **kwargs):
+        """
+        【最终优化版】Weighted QFL + Box-Aware Labels + DDP Norm
+        """
+        if 'pred_density_map' not in outputs:
+            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
+
+        src_map = outputs['pred_density_map']  # [B, 1, H, W]
+        device = src_map.device
+
+        # 1. 数值稳定性保护
+        src_map = torch.clamp(src_map, min=1e-6, max=1.0 - 1e-6)
+
+        # 2. 获取 Target Map 和 Weight Map (一步完成)
+        # 如果 kwargs 里有缓存（例如在 Dataset 里算好的），直接用
+        # 否则在线计算（现在这个在线计算非常快）
+        if 'gt_density_map' in kwargs and 'gt_weight_map' in kwargs:
+            target_map = kwargs['gt_density_map']
+            weight_map = kwargs['gt_weight_map']
+            # 注意：如果从外部传，需要确保外部也传了 num_valid_objects，否则这里得重新算或估算
+            # 鉴于你是在线算，这里主要走 else 分支
+            total_valid_objects = kwargs.get('num_valid_objects', 1.0)
+        else:
+            with torch.no_grad():
+                target_map, weight_map, total_valid_objects = generate_targets_and_weights(
+                    targets,
+                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
+                    device,
+                    decay_beta=0.5  # 推荐 0.3-0.5，让小目标高分区域更宽
+                )
+
+        # 3. 计算 QFL (Weighted)
+        beta = 2.0
+        scale = torch.abs(target_map - src_map) ** beta
+        loss_bce = F.binary_cross_entropy(src_map, target_map, reduction='none')
+
+        # 分子：加权求和
+        loss_unnormalized = (weight_map * scale * loss_bce).sum()
+
+        # 4. DDP 全局归一化
+        # 将本地 count 转为 Tensor
+        num_valid_objects = torch.tensor(total_valid_objects, dtype=torch.float, device=device)
+
+        # 多卡同步求平均
+        global_avg_objects = reduce_mean(num_valid_objects)
+
+        # 极小值保护
+        pos_normalizer = torch.clamp(global_avg_objects, min=1.0)
+
+        # 5. 返回最终 Loss
+        # 建议系数 2.0
+        return {'loss_density': (loss_unnormalized / pos_normalizer)}
+
+    def loss_density3(self, outputs, targets, indices, num_boxes, **kwargs):
+        """
+        【适配 Sigmoid + 尺度约束版】计算加权 BCE Loss。
+        Target: 0~1 (大目标区域为 0)
+        Weight: 1.0 (背景/大目标) ~ 4.0 (小目标)
+        """
+        if 'pred_density_map' not in outputs:
+            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
+
+        src_map = outputs['pred_density_map']  # [B, 1, H, W] (已经是 0~1)
+
+        # 1. 获取 Target Map (0~1, 大目标已过滤为 0)
+        if 'gt_density_map' in kwargs:
+            target_map = kwargs['gt_density_map']
+        else:
+            with torch.no_grad():
+                target_map = generate_density_map_gt_2(
+                    targets,
+                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
+                    src_map.device
+                )
+
+        # 2. 动态生成 Pixel-wise Loss 权重图
+        B, C, H, W = src_map.shape
+        weight_map = torch.ones_like(target_map)  # 默认为 1.0 (背景权重)
+
+        for i in range(B):
+            if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+                continue
+
+            boxes = targets[i]['boxes']
+            areas = boxes[:, 2] * boxes[:, 3]
+
+            # === [同步修改] 尺度过滤 ===
+            # 在计算权重时，同样忽略大目标。
+            # 让大目标区域的权重保持默认的 1.0 (背景权重)，迫使模型将其预测为 0。
+            # 阈值必须与 GT 生成函数保持一致 (0.04)
+            is_valid_scale = areas < 0.04
+
+            if not is_valid_scale.any():
+                continue
+
+            valid_boxes = boxes[is_valid_scale]
+            valid_areas = areas[is_valid_scale]
+
+            # 计算每个框的权重值
+            scale_factor = 100.0
+            # 权重公式：小目标权重高 (~4.0)，大目标(如果没过滤)权重低 (~1.0)
+            box_weights = 1.0 + 3.0 * torch.exp(-valid_areas * scale_factor)
+
+            # 将权重填入对应的框区域
+            feat_boxes = valid_boxes * torch.tensor([W, H, W, H], device=src_map.device)
+            feat_boxes = box_cxcywh_to_xyxy(feat_boxes).long()
+
+            # 限制坐标在图像内
+            feat_boxes[:, 0::2].clamp_(0, W - 1)
+            feat_boxes[:, 1::2].clamp_(0, H - 1)
+
+            for k in range(len(valid_boxes)):
+                x1, y1, x2, y2 = feat_boxes[k]
+                w_val = box_weights[k]
+                # 处理重叠区域，保留最大权重
+                current_roi = weight_map[i, 0, y1:y2 + 1, x1:x2 + 1]
+                weight_map[i, 0, y1:y2 + 1, x1:x2 + 1] = torch.maximum(current_roi, w_val)
+
+        # 3. 计算加权 BCE Loss
+        loss = F.binary_cross_entropy(src_map, target_map, reduction='none')
+
+        # 应用权重并求平均
+        loss = (loss * weight_map).mean()
+
+        return {'loss_density': loss}
+
     # === 【新增 2】密度 Loss 计算函数 ===
+    def loss_density2(self, outputs, targets, indices, num_boxes, **kwargs):
+        """
+        【适配 Sigmoid 版】计算加权 BCE Loss。
+        Target: 0~1
+        Input: 0~1 (Sigmoid processed)
+        Weight: 1.0 (Background) ~ 5.0 (Small Object) applied to Loss
+        """
+        if 'pred_density_map' not in outputs:
+            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
+
+        src_map = outputs['pred_density_map']  # [B, 1, H, W] (已经是 0~1)
+
+        # 1. 获取 Target Map (0~1)
+        if 'gt_density_map' in kwargs:
+            target_map = kwargs['gt_density_map']
+        else:
+            with torch.no_grad():
+                # 使用修正后的 GT 生成函数
+                target_map = generate_density_map_gt_2(
+                    targets,
+                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
+                    src_map.device
+                )
+
+        # 2. 动态生成 Pixel-wise Loss 权重图
+        B, C, H, W = src_map.shape
+        weight_map = torch.ones_like(target_map)  # 默认为 1.0 (背景权重)
+
+        for i in range(B):
+            if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+                continue
+
+            boxes = targets[i]['boxes']
+            # 计算每个框的权重值
+            areas = boxes[:, 2] * boxes[:, 3]
+            scale_factor = 100.0
+            # 权重公式：小目标权重高 (~5.0)，大目标权重低 (~1.0)
+            box_weights = 1.0 + 3.0 * torch.exp(-areas * scale_factor)
+
+            # 将权重填入对应的框区域
+            # 将归一化坐标转为特征图坐标
+            feat_boxes = boxes * torch.tensor([W, H, W, H], device=src_map.device)
+            feat_boxes = box_cxcywh_to_xyxy(feat_boxes).long()
+
+            # 限制坐标在图像内
+            feat_boxes[:, 0::2].clamp_(0, W - 1)
+            feat_boxes[:, 1::2].clamp_(0, H - 1)
+
+            for k in range(len(boxes)):
+                x1, y1, x2, y2 = feat_boxes[k]
+                w_val = box_weights[k]
+                # 处理重叠区域，保留最大权重 (即保留对小目标的关注)
+                current_roi = weight_map[i, 0, y1:y2 + 1, x1:x2 + 1]
+                weight_map[i, 0, y1:y2 + 1, x1:x2 + 1] = torch.maximum(current_roi, w_val)
+
+        # 3. 计算加权 BCE Loss
+        # 注意：src_map 已经是 Sigmoid 过的，所以用 binary_cross_entropy
+        # reduction='none' 以便应用权重
+        loss = F.binary_cross_entropy(src_map, target_map, reduction='none')
+
+        # 应用权重并求平均
+        loss = (loss * weight_map).mean()
+
+        return {'loss_density': loss}
+
     def loss_density(self, outputs, targets, indices, num_boxes, **kwargs):
+        """
+        【最终修正版】Weighted MSE + Target Mass Normalization
+        既解决了大小物体平衡，又避免了背景稀释梯度。
+        """
+        if 'pred_density_map' not in outputs:
+            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
+
+        pred_logits = outputs['pred_density_map']
+
+        # 1. 获取 Target 和 Weight
+        if 'gt_density_map' in kwargs:
+            target_map = kwargs['gt_density_map']
+            weight_map = kwargs['gt_weight_map']
+        else:
+            with torch.no_grad():
+                target_map, weight_map = generate_targets_and_weights_adaptive(
+                    targets, pred_logits.shape, pred_logits.device, 0.02
+                )
+
+        # 2. Logits -> Sigmoid -> MSE
+        pred_score = pred_logits.sigmoid()
+        loss_pixel = F.mse_loss(pred_score, target_map, reduction='none')
+
+        # 3. 加权 (你的小目标权重策略)
+        loss_weighted = loss_pixel * weight_map
+
+        # 4. 【核心修正】归一化：除以 Target 的总和 (Target Mass)
+        # 含义：平均每个"正样本强度单位"的误差
+        # 优点：
+        #   1. 背景 Target=0，不占分母，不会稀释梯度。
+        #   2. 大物体 Target Sum 大，Loss 被除得更多；小物体 Target Sum 小，Loss 保留更多。天然平衡！
+
+        normalizer = target_map.sum()
+
+        # DDP 同步
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(normalizer)
+            normalizer = normalizer / dist.get_world_size()
+
+        # 极小值保护 (防止全是背景时除以0)
+        normalizer = torch.clamp(normalizer, min=1.0)
+
+        # 5. 系数
+        # 这种归一化方式下，Loss 大概在 0.01 ~ 0.05 级别
+        # 建议乘 20.0，让最终 Loss 在 0.2 ~ 1.0 之间
+        return {'loss_density': (loss_weighted.sum() / normalizer)/5}
+
+    def loss_density_first(self, outputs, targets, indices, num_boxes, **kwargs):
         """计算 MSE Loss"""
         if 'pred_density_map' not in outputs:
             return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
@@ -210,10 +470,6 @@ class SetCriterion(nn.Module):
         # 计算 MSE
         loss = F.mse_loss(src_map, target_map)
         return {'loss_density': loss}
-
-    # =========================================================================
-    # === 修复：所有标准 Loss 函数必须接收 **kwargs 以忽略多余参数 (如 gt_density_map) ===
-    # =========================================================================
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         assert 'pred_logits' in outputs
@@ -337,7 +593,6 @@ class SetCriterion(nn.Module):
         }
         return losses
 
-
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
@@ -358,6 +613,7 @@ class SetCriterion(nn.Module):
         # ==========================================================
         # === 优化 1：将一致性合并逻辑提取为静态方法 (对齐 MS-DETR) ===
         # ==========================================================
+
     @staticmethod
     def indices_merge(indices_o2o, indices_o2m_raw):
         """
@@ -393,6 +649,7 @@ class SetCriterion(nn.Module):
             final_indices_o2m.append((new_src, new_tgt))
 
         return final_indices_o2m
+
     def forward(self, outputs, targets):
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
@@ -515,7 +772,7 @@ class SetCriterion(nn.Module):
         dn_positive_idx, dn_num_group = dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
         num_gts = [len(t['labels']) for t in targets]
         device = targets[0]['labels'].device
-        
+
         dn_match_indices = []
         for i, num_gt in enumerate(num_gts):
             if num_gt > 0:
@@ -525,8 +782,8 @@ class SetCriterion(nn.Module):
                 dn_match_indices.append((dn_positive_idx[i], gt_idx))
             else:
                 dn_match_indices.append((torch.zeros(0, dtype=torch.int64, device=device), \
-                    torch.zeros(0, dtype=torch.int64,  device=device)))
-        
+                                         torch.zeros(0, dtype=torch.int64, device=device)))
+
         return dn_match_indices
 
 
@@ -582,64 +839,329 @@ def generate_density_map_gt(targets, feat_shape, device, sigma=None):  # sigma �
             density_map[i, 0] = val
 
     return density_map
-# === 【新增 1】GT 生成工具函数 (加在 SetCriterion 类外面) ===
-def generate_density_map_gt_2(targets, feat_shape, device, sigma=2.0):
+
+
+def generate_targets_and_weights_adaptive(targets, feat_shape, device, threshold=0.02):
     """
-    【高性能版】生成【面积加权】的高斯密度图 GT。
-    效果与 generate_density_map_gt 严格一致 (Max聚合 + 无归一化)。
+    【S3 最终版】尺度自适应 Box-Aware Centerness
+    核心创新：
+    1. 小目标使用极小的 beta (如 0.2)，使其高分区域非常宽（平顶分布）。
+    2. 稍大的目标使用正常的 beta (如 0.8)，保持定位精度。
+    """
+    B, _, H, W = feat_shape
+    target_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
+    weight_map = torch.ones((B, 1, H, W), dtype=torch.float32, device=device)
+    total_valid_objects = 0
+
+    # ... (网格生成代码同前，省略) ...
+    # 构造网格
+    y_range = torch.arange(H, device=device, dtype=torch.float32) + 0.5
+    x_range = torch.arange(W, device=device, dtype=torch.float32) + 0.5
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+    grid_y_flat = grid_y.flatten()
+    grid_x_flat = grid_x.flatten()
+
+    for i in range(B):
+        if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+            continue
+
+        boxes = targets[i]['boxes']
+        areas = boxes[:, 2] * boxes[:, 3]
+
+        # 1. 过滤大目标 (保持不变)
+        is_valid_scale = areas < threshold
+        if not is_valid_scale.any(): continue
+
+        valid_boxes = boxes[is_valid_scale]
+        valid_areas = areas[is_valid_scale]
+        N = len(valid_boxes)
+
+        # 坐标转换 ... (同前，省略)
+        cx = valid_boxes[:, 0] * W
+        cy = valid_boxes[:, 1] * H
+        w_half = (valid_boxes[:, 2] * W) / 2.0
+        h_half = (valid_boxes[:, 3] * H) / 2.0
+        x1 = (cx - w_half).view(N, 1)
+        y1 = (cy - h_half).view(N, 1)
+        x2 = (cx + w_half).view(N, 1)
+        y2 = (cy + h_half).view(N, 1)
+
+        # ... (计算 l, r, t, b 同前) ...
+        l = grid_x_flat[None, :] - x1
+        r = x2 - grid_x_flat[None, :]
+        t = grid_y_flat[None, :] - y1
+        b = y2 - grid_y_flat[None, :]
+        is_in_box = (l > 0) & (r > 0) & (t > 0) & (b > 0)
+
+        # === 2. 计算基础 Centerness ===
+        min_lr = torch.min(l, r)
+        max_lr = torch.max(l, r)
+        min_tb = torch.min(t, b)
+        max_tb = torch.max(t, b)
+        # 计算乘积
+        product = (min_lr / max_lr.clamp(min=1e-6)) * (min_tb / max_tb.clamp(min=1e-6))
+
+        # 【关键修正】先 clamp 到 0，再开根号！
+        # 防止部分在内部分在外导致的负数乘积
+        raw_centerness = torch.sqrt(product.clamp(min=0))
+
+        # === [核心修改] 3. 动态 Beta 计算 ===
+        # 逻辑：面积越小，beta 越小 (分布越平/越宽)
+        # 设面积阈值：0.005 (极小) -> beta=0.2
+        #             0.04  (中等) -> beta=1.0
+        # 建立一个线性映射或分段映射
+
+        # 归一化面积到 0~1 之间 (相对于 0.04)
+        area_ratio = valid_areas / threshold
+
+        # 映射公式：beta = 0.2 + 0.8 * area_ratio
+        # 极小物体(area~0): beta -> 0.2 (超级平顶，像个方块)
+        # 较大物体(area~0.04): beta -> 1.0 (正常金字塔)
+
+        box_betas = 0.2 + 0.8 * area_ratio
+        box_betas = torch.clamp(box_betas, min=0.2, max=1.0)
+
+        # 广播到 [N, 1]
+        box_betas = box_betas.view(N, 1)
+
+        # 应用动态衰减
+        # Pow 操作会自动广播: [N, H*W] ^ [N, 1]
+        final_target = torch.pow(raw_centerness, box_betas)
+
+        # Masking
+        final_target = final_target * is_in_box.float()
+
+        # === 4. 权重计算 (保持之前的强力加权) ===
+        scale_factor = 100.0
+        box_weights = 1.0 + 10.0 * torch.exp(-valid_areas * scale_factor)
+        box_weights = box_weights.view(N, 1) * is_in_box.float()
+
+        # === 5. 聚合 ===
+        if N > 0:
+            max_target, _ = final_target.max(dim=0)
+            target_map[i, 0] = max_target.view(H, W)
+
+            max_weight, _ = box_weights.max(dim=0)
+            current_weight_plane = max_weight.view(H, W)
+            weight_map[i, 0] = torch.maximum(weight_map[i, 0], current_weight_plane)
+
+    return target_map, weight_map
+
+
+def generate_targets_and_weights(targets, feat_shape, device, decay_beta=0.5):
+    """
+    【修复 NaN Bug 版】全向量化生成 Box-Aware Density & Weight
+    修复点：在 sqrt 之前对负数进行 clamp(min=0)，防止 Box 外部点产生 NaN。
+    """
+    B, H, W = feat_shape
+    density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
+    weight_map = torch.ones((B, 1, H, W), dtype=torch.float32, device=device)
+    total_valid_objects = 0
+
+    # 构造网格
+    y_range = torch.arange(H, device=device, dtype=torch.float32) + 0.5
+    x_range = torch.arange(W, device=device, dtype=torch.float32) + 0.5
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+    grid_y_flat = grid_y.flatten()
+    grid_x_flat = grid_x.flatten()
+
+    for i in range(B):
+        if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+            continue
+
+        boxes = targets[i]['boxes']
+        areas = boxes[:, 2] * boxes[:, 3]
+
+        # 尺度过滤
+        is_valid_scale = areas < 0.04
+        if not is_valid_scale.any():
+            continue
+
+        valid_boxes = boxes[is_valid_scale]
+        valid_areas = areas[is_valid_scale]
+        N = len(valid_boxes)
+
+        # 必须检查 N > 0
+        if N == 0: continue
+
+        total_valid_objects += N
+
+        # 坐标变换
+        cx = valid_boxes[:, 0] * W
+        cy = valid_boxes[:, 1] * H
+        w_half = (valid_boxes[:, 2] * W) / 2.0
+        h_half = (valid_boxes[:, 3] * H) / 2.0
+
+        x1 = (cx - w_half).view(N, 1)
+        y1 = (cy - h_half).view(N, 1)
+        x2 = (cx + w_half).view(N, 1)
+        y2 = (cy + h_half).view(N, 1)
+
+        # 计算距离
+        l = grid_x_flat[None, :] - x1
+        r = x2 - grid_x_flat[None, :]
+        t = grid_y_flat[None, :] - y1
+        b = y2 - grid_y_flat[None, :]
+
+        is_in_box = (l > 0) & (r > 0) & (t > 0) & (b > 0)
+
+        # Part A: Target Map
+        min_lr = torch.min(l, r)
+        max_lr = torch.max(l, r)
+        min_tb = torch.min(t, b)
+        max_tb = torch.max(t, b)
+
+        # === 【关键修复】 ===
+        # 计算乘积
+        product = (min_lr / max_lr.clamp(min=1e-6)) * (min_tb / max_tb.clamp(min=1e-6))
+
+        # 必须先 clamp 到 0，再开根号！
+        # 否则 Box 外部的点是负数，sqrt(负数) = NaN，NaN * 0 还是 NaN
+        centerness = torch.sqrt(product.clamp(min=0))
+
+        centerness = torch.pow(centerness, decay_beta)
+        centerness_scores = centerness * is_in_box.float()
+
+        # Part B: Weight Map
+        scale_factor = 100.0
+        box_weight_scalars = 1.0 + 3.0 * torch.exp(-valid_areas * scale_factor)
+        box_weight_maps = box_weight_scalars.view(N, 1) * is_in_box.float()
+
+        # Part C: 聚合
+        if N > 0:
+            max_conf, _ = centerness_scores.max(dim=0)
+            density_map[i, 0] = max_conf.view(H, W)
+
+            max_weights, _ = box_weight_maps.max(dim=0)
+            current_weight_plane = max_weights.view(H, W)
+            weight_map[i, 0] = torch.maximum(weight_map[i, 0], current_weight_plane)
+
+    return density_map, weight_map, total_valid_objects
+
+
+def generate_density_map_gt_2(targets, feat_shape, device, sigma=None):
+    """
+    【S3 专属版】生成 0~1 的高斯密度图 GT。
+    关键特性：过滤掉大目标 (Large Objects)，使其 Target=0。
     """
     B, H, W = feat_shape
     density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
 
-    # 1. 预先生成网格坐标 [1, H, W]
-    # 注意：meshgrid 的 indexing='ij' 对应 (y, x)，与你的 grid_y, grid_x 逻辑一致
+    # 1. 坐标网格
     y_range = torch.arange(H, device=device)
     x_range = torch.arange(W, device=device)
     grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
-
-    # 扩展维度以便广播: [1, H, W]
-    grid_y = grid_y.unsqueeze(0)
+    grid_y = grid_y.unsqueeze(0)  # [1, H, W]
     grid_x = grid_x.unsqueeze(0)
 
     for i in range(B):
         if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
             continue
 
-        boxes = targets[i]['boxes']  # [N, 4]
-        N = len(boxes)
-
-        # === 向量化计算面积权重 ===
-        # areas: [N]
+        boxes = targets[i]['boxes']  # [N, 4] (cx, cy, w, h)
         areas = boxes[:, 2] * boxes[:, 3]
-        scale_factor = 100.0
-        # weights: [N] -> [N, 1, 1] 以便广播
-        weights = 1.0 + 4.0 * torch.exp(-areas * scale_factor)
-        weights = weights.view(N, 1, 1)
 
-        # === 向量化计算中心点 ===
-        # cx, cy: [N] -> [N, 1, 1]
-        cx = (boxes[:, 0] * W).view(N, 1, 1)
-        cy = (boxes[:, 1] * H).view(N, 1, 1)
+        # === [核心修改] 尺度过滤 (Scale Filtering) ===
+        # 过滤掉面积大于 0.04 (约 128x128 像素) 的大目标
+        # 这些大目标在 S3 密度图上被视为背景 (Target=0)
+        is_valid_scale = areas < 0.04
 
-        # === 核心广播计算 ===
-        # (grid - center)^2 : [1, H, W] - [N, 1, 1] -> [N, H, W]
+        if not is_valid_scale.any():
+            continue
+
+        # 只处理中小目标
+        valid_boxes = boxes[is_valid_scale]
+        valid_areas = areas[is_valid_scale]
+        N = len(valid_boxes)
+
+        # 2. 转换到特征图尺度
+        w_feat = valid_boxes[:, 2] * W
+        h_feat = valid_boxes[:, 3] * H
+        cx = valid_boxes[:, 0] * W
+        cy = valid_boxes[:, 1] * H
+
+        # 3. 基础 Sigma & 小目标补偿
+        base_sigma = torch.clamp(torch.min(w_feat, h_feat) / 2.0, min=1.0)  # [N]
+        is_very_small = valid_areas < 0.003
+
+        adaptive_sigmas = torch.where(is_very_small, base_sigma * 1.5 + 1.0, base_sigma)
+        adaptive_sigmas = adaptive_sigmas.view(N, 1, 1)
+
+        # 4. 向量化计算高斯
+        cx = cx.view(N, 1, 1)
+        cy = cy.view(N, 1, 1)
+
         dist_sq = (grid_x - cx) ** 2 + (grid_y - cy) ** 2
+        gaussian = torch.exp(-dist_sq / (2 * adaptive_sigmas ** 2))  # [N, H, W]
 
-        # 高斯分布: [N, H, W]
-        gaussian = torch.exp(-dist_sq / (2 * sigma ** 2))
-
-        # 应用权重: [N, H, W] * [N, 1, 1]
-        weighted_gaussian = gaussian * weights
-
-        # === Max 聚合 ===
-        # 对应你代码中的 torch.maximum
-        # 从 [N, H, W] 压缩到 [H, W]
+        # 5. Max 聚合
         if N > 0:
-            # val: [H, W], idx: [H, W]
-            val, _ = weighted_gaussian.max(dim=0)
+            val, _ = gaussian.max(dim=0)
             density_map[i, 0] = val
 
     return density_map
+
+
+# === 【新增 1】GT 生成工具函数 (加在 SetCriterion 类外面) ===
+def generate_density_map_gt_3(targets, feat_shape, device, sigma=None):
+    """
+    【修正版】生成 0~1 的高斯密度图 GT，并包含小目标 Sigma 补偿。
+    注意：不再包含 area weight，权重将移至 Loss 计算中。
+    """
+    B, H, W = feat_shape
+    density_map = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
+
+    # 1. 坐标网格
+    y_range = torch.arange(H, device=device)
+    x_range = torch.arange(W, device=device)
+    grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
+    grid_y = grid_y.unsqueeze(0)  # [1, H, W]
+    grid_x = grid_x.unsqueeze(0)
+
+    for i in range(B):
+        if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
+            continue
+
+        boxes = targets[i]['boxes']  # [N, 4] (cx, cy, w, h) 归一化坐标
+        N = len(boxes)
+
+        # 2. 转换到特征图尺度
+        w_feat = boxes[:, 2] * W
+        h_feat = boxes[:, 3] * H
+        cx = boxes[:, 0] * W
+        cy = boxes[:, 1] * H
+
+        # 3. 基础 Sigma (3-sigma 原则，半径约为 min(w,h)/2)
+        # 加上 clamp 防止过小
+        base_sigma = torch.clamp(torch.min(w_feat, h_feat) / 2.0, min=1.0)  # [N]
+
+        # === 创新点：小目标 Sigma 空间补偿 ===
+        # 逻辑：如果物体很小，我们人为“虚胖”它的高斯核，
+        # 让它在特征图上占据更多像素，增加被 Query 选中的容错率。
+        # 阈值：32像素对应 stride 8 的特征图上是 4。4*4=16。
+        # 相对面积阈值：(32/640)^2 ≈ 0.0025
+        areas = boxes[:, 2] * boxes[:, 3]
+        is_small = areas < 0.003  # 稍微放宽一点阈值
+
+        # 对小目标：Sigma 放大 1.5 倍 + 1.0 的偏置
+        adaptive_sigmas = torch.where(is_small, base_sigma * 1.5 + 1.0, base_sigma)
+        adaptive_sigmas = adaptive_sigmas.view(N, 1, 1)
+
+        # 4. 向量化计算高斯 (Target 峰值为 1.0)
+        # cx, cy 广播
+        cx = cx.view(N, 1, 1)
+        cy = cy.view(N, 1, 1)
+
+        dist_sq = (grid_x - cx) ** 2 + (grid_y - cy) ** 2
+        gaussian = torch.exp(-dist_sq / (2 * adaptive_sigmas ** 2))  # [N, H, W]
+
+        # 5. Max 聚合
+        if N > 0:
+            val, _ = gaussian.max(dim=0)
+            density_map[i, 0] = val
+
+    return density_map
+
 
 @torch.no_grad()
 def accuracy(output, target, topk=(1,)):
@@ -658,7 +1180,3 @@ def accuracy(output, target, topk=(1,)):
         correct_k = correct[:k].view(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
-
-
-
-

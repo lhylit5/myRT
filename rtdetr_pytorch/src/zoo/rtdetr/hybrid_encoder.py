@@ -17,12 +17,17 @@ __all__ = ['HybridEncoder']
 
 from .visualize import visualize_features
 
-# 在文件顶部加上 import
+# # 在文件顶部加上 import
 try:
     # 调整为你的实际路径
     from .new_small_enhance import SmallObjectEnhance
 except Exception:
     from src.models.small_object_enhance import SmallObjectEnhance
+# try:
+#     # 调整为你的实际路径
+#     from .small_object_enhance import SmallObjectEnhance
+# except Exception:
+#     from src.models.small_object_enhance import SmallObjectEnhance
 
 
 class ConvNormLayer(nn.Module):

@@ -131,7 +131,9 @@ class SmallObjectEnhance(nn.Module):
 
         # 密度图预测头
         self.density_head = nn.Conv2d(out_ch, 1, 1)
-        self.relu = nn.ReLU(inplace=True)
+        # self.relu = nn.ReLU(inplace=True)
+
+        self.sigmoid = nn.Sigmoid()
 
         # 可学习系数 (保持你的风格，初始化为 1.0)
         self.alpha = nn.Parameter(torch.zeros(1))
@@ -145,7 +147,7 @@ class SmallObjectEnhance(nn.Module):
         Fc = self.dynamic_ccm(S)  # [B, 256, H, W]
 
         # 2. 生成密度图 (用于 Loss)
-        pred_density_map = self.relu(self.density_head(Fc))
+        pred_density_map = self.density_head(Fc)
 
         # 3. 特征增强 (Coordinate Attention)
         enhanced_S = S
