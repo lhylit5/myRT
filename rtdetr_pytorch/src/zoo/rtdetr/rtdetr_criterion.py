@@ -446,7 +446,7 @@ class SetCriterion(nn.Module):
         # 5. 系数
         # 这种归一化方式下，Loss 大概在 0.01 ~ 0.05 级别
         # 建议乘 20.0，让最终 Loss 在 0.2 ~ 1.0 之间
-        return {'loss_density': (loss_weighted.sum() / normalizer)/5}
+        return {'loss_density': (loss_weighted.sum() / normalizer)/2}
 
     def loss_density_first(self, outputs, targets, indices, num_boxes, **kwargs):
         """计算 MSE Loss"""
@@ -933,7 +933,7 @@ def generate_targets_and_weights_adaptive(targets, feat_shape, device, threshold
 
         # === 4. 权重计算 (保持之前的强力加权) ===
         scale_factor = 100.0
-        box_weights = 1.0 + 10.0 * torch.exp(-valid_areas * scale_factor)
+        box_weights = 1.0 + 4 * torch.exp(-valid_areas * scale_factor)
         box_weights = box_weights.view(N, 1) * is_in_box.float()
 
         # === 5. 聚合 ===

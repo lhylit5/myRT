@@ -528,62 +528,133 @@ class RTDETRTransformer(nn.Module):
         # ====================================================================================
         # === Point 2 核心逻辑：基于密度与门控的 S3 Query 智能筛选 ===
         # ====================================================================================
-        # 只有在开启开关，且密度图存在时才执行 (训练期或推理期均可)
-        num_queries = self.num_queries  # 300
-        num_rescue = 40  # 救援名额 (可以调，比如 50~100)
-        num_base = num_queries - num_rescue  # 250
+        # 2. 准备 S3 密度加成
         if self.use_density_query_selection and density_map is not None:
-            # --- 1. 准备数据 ---
-            # 原始分类分数
-            density_map = density_map.sigmoid()
+            # 1. 原始分类分数 (Sigmoid)
             enc_probs = enc_outputs_class.sigmoid()
-            topk_score_cls = enc_probs.max(-1).values  # [B, Total]
+            topk_score_cls = enc_probs.max(-1).values  # [B, Total_Anchors]
+            # === 参数设置 ===
+            num_queries = self.num_queries  # 300
+            num_safe = 200  # 【保底名额】：留给高分大物体，雷打不动
+            # 如果你想要更激进的 rescue，可以调小这个值，比如 100
 
-            # S3 密度分数
+            # === Step 1: VIP 保底筛选 (仅基于 Cls) ===
+            # 选出最自信的 Top-150，这些通常是大物体或极清晰的小物体
+            # topk_inds_safe: [B, 150]
+            scores_safe, topk_inds_safe = torch.topk(topk_score_cls, num_safe, dim=1)
+
+            # === Step 2: 准备互补评分 (针对剩余名额) ===
+            # 获取密度图并展平
+            density_map = density_map.sigmoid()
             s3_h, s3_w = spatial_shapes[0]
             num_s3 = s3_h * s3_w
 
-            # 展平密度图
-            density_score = density_map.flatten(2).permute(0, 2, 1)  # [B, S3_Token, 1]
+            # 构造全尺寸密度分数 [B, Total]
+            # 默认给负分，防止 S4/S5 被错误加分
+            full_density_score = torch.zeros_like(topk_score_cls)
 
-            # 构建全尺度密度分数 (S4/S5 为 -1，确保不被选中)
-            total_anchors = enc_outputs_class.shape[1]
-            # 初始化为 -1.0 (负分，确保排序垫底)
-            full_density_score = torch.full((bs, total_anchors), -1.0,
-                                            device=enc_outputs_class.device,
-                                            dtype=enc_outputs_class.dtype)
+            # 填充 S3 部分
+            density_s3 = density_map.flatten(2).squeeze(1)  # [B, S3]
+            if valid_mask is not None:
+                density_s3 = density_s3 * valid_mask[:, :num_s3, 0]
+            full_density_score[:, :num_s3] = density_s3
 
-            if total_anchors >= num_s3:
-                # 填充 S3 部分 (应用 valid_mask 防止边缘噪声)
-                # 注意：这里不需要 learnable_scale，直接用原始概率值排序即可
-                valid_mask_s3 = valid_mask[:, :num_s3, 0]
-                # 将被 mask 掉的区域设为 -1
-                clean_s3_score = density_score.squeeze(-1) * valid_mask_s3
-                clean_s3_score = torch.where(valid_mask_s3 > 0, clean_s3_score,
-                                             torch.tensor(-1.0, device=clean_s3_score.device))
+            # 【核心公式】：互补评分
+            # Score_new = Cls + alpha * Density * (1 - Cls)^beta
+            # 这个公式本身就有“不公平”属性：它专门偏袒“分类低但密度高”的点
+            alpha = 1.0
+            beta = 2.0
+            uncertainty = torch.pow(1.0 - topk_score_cls, beta)
+            boost_score = alpha * full_density_score * uncertainty
+            mixed_score = topk_score_cls + boost_score
 
-                full_density_score[:, :num_s3] = clean_s3_score
+            # === Step 3: 排除已入选 VIP 的点 ===
+            # 我们要在 mixed_score 中选剩下的 150 个，但不能选已经在 Step 1 选过的
+            # 方法：将已选位置的分数设为 -inf
 
-            # --- 2. 赛道一：保底组 (Base Group) ---
-            # 选 Top-250
-            _, base_inds = torch.topk(topk_score_cls, num_base, dim=1)  # [B, 250]
+            # scatter 的 dim=1
+            # src 必须是 tensor，这里用 -inf 填充
+            inf_tensor = torch.full_like(scores_safe, float('-inf'))
 
-            # --- 3. 赛道二：救援组 (Rescue Group) ---
-            # 为了避免重复，我们可以先把已经入选 Base 组的位置在密度分数里剔除
-            # (将已选位置的密度分设为 -2)
-            mask_density = full_density_score.clone()
-            # scatter_: 将 base_inds 对应位置的分数设为 -2
-            mask_density.scatter_(1, base_inds, -2.0)
+            # 克隆一份用于修改
+            mask_mixed_score = mixed_score.clone()
+            # 将 topk_inds_safe 对应位置的分数抹除
+            mask_mixed_score.scatter_(1, topk_inds_safe, inf_tensor)
 
-            # 从剩下的里面选密度最高的 50 个 S3 Token
-            _, rescue_inds = torch.topk(mask_density, num_rescue, dim=1)  # [B, 50]
+            # === Step 4: 互补竞技场筛选 (选剩余的 Top-150) ===
+            num_rescue = num_queries - num_safe
+            _, topk_inds_rescue = torch.topk(mask_mixed_score, num_rescue, dim=1)
 
-            # --- 4. 合并 (Union) ---
-            topk_ind = torch.cat([base_inds, rescue_inds], dim=1)  # [B, 300]
+            # === Step 5: 合并 ===
+            # cat: [B, 300]
+            topk_ind = torch.cat([topk_inds_safe, topk_inds_rescue], dim=1)
+
+            # (可选) 重新按照分数排个序，虽然 DETR 不强制要求 Query 有序，但看着舒服
+            # gather 对应的分数并排序... (一般不需要)
 
         else:
             # 原始逻辑
             _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
+        # if self.use_density_query_selection and density_map is not None:
+        #     # 只有在开启开关，且密度图存在时才执行 (训练期或推理期均可)
+        #     num_queries = self.num_queries  # 300
+        #     num_rescue = 40  # 救援名额 (可以调，比如 50~100)
+        #     num_base = num_queries - num_rescue  # 250
+        #     # 1. 原始分类分数 (Sigmoid)
+        #     enc_probs = enc_outputs_class.sigmoid()
+        #     topk_score_cls = enc_probs.max(-1).values  # [B, Total_Anchors]
+        #
+        #     # --- 1. 准备数据 ---
+        #     # 原始分类分数
+        #     density_map = density_map.sigmoid()
+        #     enc_probs = enc_outputs_class.sigmoid()
+        #     topk_score_cls = enc_probs.max(-1).values  # [B, Total]
+        #
+        #     # S3 密度分数
+        #     s3_h, s3_w = spatial_shapes[0]
+        #     num_s3 = s3_h * s3_w
+        #
+        #     # 展平密度图
+        #     density_score = density_map.flatten(2).permute(0, 2, 1)  # [B, S3_Token, 1]
+        #
+        #     # 构建全尺度密度分数 (S4/S5 为 -1，确保不被选中)
+        #     total_anchors = enc_outputs_class.shape[1]
+        #     # 初始化为 -1.0 (负分，确保排序垫底)
+        #     full_density_score = torch.full((bs, total_anchors), -1.0,
+        #                                     device=enc_outputs_class.device,
+        #                                     dtype=enc_outputs_class.dtype)
+        #
+        #     if total_anchors >= num_s3:
+        #         # 填充 S3 部分 (应用 valid_mask 防止边缘噪声)
+        #         # 注意：这里不需要 learnable_scale，直接用原始概率值排序即可
+        #         valid_mask_s3 = valid_mask[:, :num_s3, 0]
+        #         # 将被 mask 掉的区域设为 -1
+        #         clean_s3_score = density_score.squeeze(-1) * valid_mask_s3
+        #         clean_s3_score = torch.where(valid_mask_s3 > 0, clean_s3_score,
+        #                                      torch.tensor(-1.0, device=clean_s3_score.device))
+        #
+        #         full_density_score[:, :num_s3] = clean_s3_score
+        #
+        #     # --- 2. 赛道一：保底组 (Base Group) ---
+        #     # 选 Top-250
+        #     _, base_inds = torch.topk(topk_score_cls, num_base, dim=1)  # [B, 250]
+        #
+        #     # --- 3. 赛道二：救援组 (Rescue Group) ---
+        #     # 为了避免重复，我们可以先把已经入选 Base 组的位置在密度分数里剔除
+        #     # (将已选位置的密度分设为 -2)
+        #     mask_density = full_density_score.clone()
+        #     # scatter_: 将 base_inds 对应位置的分数设为 -2
+        #     mask_density.scatter_(1, base_inds, -2.0)
+        #
+        #     # 从剩下的里面选密度最高的 50 个 S3 Token
+        #     _, rescue_inds = torch.topk(mask_density, num_rescue, dim=1)  # [B, 50]
+        #
+        #     # --- 4. 合并 (Union) ---
+        #     topk_ind = torch.cat([base_inds, rescue_inds], dim=1)  # [B, 300]
+        #
+        # else:
+        #     # 原始逻辑
+        #     _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
 
 
         # if self.use_density_query_selection and density_map is not None:
