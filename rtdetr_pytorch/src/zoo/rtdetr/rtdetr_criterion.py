@@ -10,6 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torch.distributed as dist
+from torchvision.ops import sigmoid_focal_loss
+
 # from torchvision.ops import box_convert, generalized_box_iou
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 
@@ -401,6 +403,63 @@ class SetCriterion(nn.Module):
         return {'loss_density': loss}
 
     def loss_density(self, outputs, targets, indices, num_boxes, **kwargs):
+        """
+        【Focal Loss 版】Density Loss
+        参考 Salience-DETR，解决正负样本（前景背景）极端不平衡问题。
+        """
+        if 'pred_density_map' not in outputs:
+            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
+
+        pred_logits = outputs['pred_density_map']  # [B, 1, H, W]
+
+        # 1. 获取 Target 和 Weight (与之前保持一致)
+        if 'gt_density_map' in kwargs:
+            target_map = kwargs['gt_density_map']
+            weight_map = kwargs['gt_weight_map']
+        else:
+            with torch.no_grad():
+                # 注意：这里使用你之前定义的自适应生成函数
+                target_map, weight_map = generate_targets_and_weights_adaptive(
+                    targets, pred_logits.shape, pred_logits.device, 0.02
+                )
+
+        # 2. 计算 Focal Loss
+        # Inputs: pred_logits (无 Sigmoid), target_map (0~1 float)
+        # Alpha=0.25: 降低背景(负样本)权重
+        # Gamma=2.0: 挖掘困难样本
+        loss_focal = sigmoid_focal_loss(
+            pred_logits,
+            target_map,
+            alpha=0.25,
+            gamma=2.0,
+            reduction='none'
+        )
+
+        # 3. 空间加权 (Apply Spatial Weight)
+        # 对小目标区域再次加强 Loss
+        loss_weighted = loss_focal * weight_map
+
+        # 4. 归一化 (Normalization)
+        # Salience-DETR 使用 num_pos (mask > 0.5 的像素数)
+        # 这里推荐使用 target_map.sum() (Target Mass, 软正样本数)
+        # 理由：你的 Target 是高斯/平顶分布的软标签，sum() 能反映目标的“总能量”。
+        normalizer = target_map.sum()
+
+        # DDP 同步
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(normalizer)
+            normalizer = normalizer / dist.get_world_size()
+
+        # 极小值保护
+        normalizer = torch.clamp(normalizer, min=1.0)
+
+        # 5. 最终 Loss
+        # Focal Loss 的数值通常比 MSE 小很多 (数量级差异)
+        # 建议不需要像 MSE 那样除以 2 或者乘 20，直接除以 normalizer 即可
+        # 观察：如果 Loss 值过小(如 1e-3)，可以乘以一个系数 (e.g., * 5.0) 来平衡 Total Loss
+        return {'loss_density': loss_weighted.sum() / normalizer}
+
+    def loss_density_MSE2(self, outputs, targets, indices, num_boxes, **kwargs):
         """
         【最终修正版】Weighted MSE + Target Mass Normalization
         既解决了大小物体平衡，又避免了背景稀释梯度。

@@ -563,7 +563,7 @@ class RTDETRTransformer(nn.Module):
             # Score_new = Cls + alpha * Density * (1 - Cls)^beta
             # 这个公式本身就有“不公平”属性：它专门偏袒“分类低但密度高”的点
             alpha = 1.0
-            beta = 2.0
+            beta = 1.0
             uncertainty = torch.pow(1.0 - topk_score_cls, beta)
             boost_score = alpha * full_density_score * uncertainty
             mixed_score = topk_score_cls + boost_score
