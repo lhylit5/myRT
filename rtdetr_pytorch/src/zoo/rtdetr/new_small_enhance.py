@@ -57,7 +57,7 @@ class CoordAtt(nn.Module):
 
 
 
-class DynamicCCM(nn.Module):
+class DSAM(nn.Module):
     def __init__(self, in_channel, mid_channel, out_channel, dilation_list=[1, 2, 4]):
         super().__init__()
         self.mid_channel = mid_channel
@@ -125,7 +125,7 @@ class SmallObjectEnhance(nn.Module):
         self.use_feature_enhance = use_feature_enhance
 
 
-        self.dynamic_ccm = DynamicCCM(in_ch, mid_ch, out_ch, dilation_list=[1, 2, 4])
+        self.dsam = DSAM(in_ch, mid_ch, out_ch, dilation_list=[1, 2, 4])
 
         self.coord_att = CoordAtt(out_ch, out_ch)
 
@@ -144,7 +144,7 @@ class SmallObjectEnhance(nn.Module):
 
         S = feats[0]  # S3 Feature [B, 256, H, W]
 
-        Fc = self.dynamic_ccm(S)  # [B, 256, H, W]
+        Fc = self.dsam(S)  # [B, 256, H, W]
 
         # 2. 生成密度图 (用于 Loss)
         pred_density_map = self.density_head(Fc)
