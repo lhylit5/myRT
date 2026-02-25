@@ -43,7 +43,7 @@ HybridEncoder:
   # eval
   eval_spatial_size: [640, 640]
 
-  small_object_enhance: SmallObjectEnhance
+  small_object_enhance:
 
 SmallObjectEnhance:
   _name: SmallObjectEnhance
@@ -53,8 +53,7 @@ SmallObjectEnhance:
 #  ccm_cfg: [512, 512, 256, 256]
 #  dilation: 2
 #  use_bn: True
-  use_feature_enhance: False
-
+  use_feature_enhance: True
 RTDETRTransformer:
   feat_channels: [256, 256, 256]
   feat_strides: [8, 16, 32]
@@ -69,10 +68,11 @@ RTDETRTransformer:
   eval_idx: -1
   eval_spatial_size: [640, 640]
 
-  use_density_query_selection: True
+  use_density_query_selection: False
   density_weight_init: [1.0, 0.3, 0.1]
 
-  use_density_aux_loss: False
+# one_to_many
+  use_o2m: True
 
 
 
@@ -87,8 +87,8 @@ SetCriterion:
   losses: ['vfl', 'boxes', 'density']
   alpha: 0.75
   gamma: 2.0
-
-  use_density_aux_loss: False
+# one_to_many
+  use_o2m: True
 
   matcher:
     type: HungarianMatcher

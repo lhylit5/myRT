@@ -219,13 +219,37 @@ class TransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
+        # 【精妙之处】：截取 FFN 前的特征
+        pre_ffn_feat = tgt
         # ffn
         tgt2 = self.forward_ffn(tgt)
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
 
-        return tgt
+        return tgt, pre_ffn_feat
 
+class O2M_FFN(nn.Module):
+    """
+    专为 O2M 辅助分支设计的独立 FFN。
+    结构与主干 TransformerDecoderLayer 内部的 FFN 完全一致，保证特征分布的稳定性。
+    """
+    def __init__(self, d_model=256, dim_feedforward=1024, dropout=0., activation="relu"):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.activation = getattr(F, activation)
+        self.dropout1 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, tgt):
+        # 1. 升维映射 + 激活
+        tgt2 = self.linear2(self.dropout1(self.activation(self.linear1(tgt))))
+        # 2. 残差连接
+        tgt = tgt + self.dropout2(tgt2)
+        # 3. 层归一化
+        tgt = self.norm(tgt)
+        return tgt
 
 class TransformerDecoder(nn.Module):
     def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
@@ -248,47 +272,63 @@ class TransformerDecoder(nn.Module):
                 memory_mask=None,
                 samples=None,
                 dn_meta=None,
-                score_head_o2m=None):
-        global boxes
+                ffn_o2m=None):  # === [新增] 接收独立的 O2M 回归头 ===
         output = tgt
         dec_out_bboxes = []
         dec_out_logits = []
-        dec_out_logits_o2m = []  # O2M logits 列表
+        dec_out_logits_o2m = []
+        dec_out_bboxes_o2m = []
         ref_points_detach = F.sigmoid(ref_points_unact)
 
         for i, layer in enumerate(self.layers):
             ref_points_input = ref_points_detach.unsqueeze(2)
             query_pos_embed = query_pos_head(ref_points_detach)
 
-            output = layer(output, ref_points_input, memory,
-                           memory_spatial_shapes, memory_level_start_index,
-                           attn_mask, memory_mask, query_pos_embed)
+            # --- 1. 共享的 Attention 计算，接收两个特征 ---
+            output, pre_ffn_feat = layer(output, ref_points_input, memory, memory_spatial_shapes,
+                                         memory_level_start_index, attn_mask, memory_mask, query_pos_embed)
 
+            # --- 2. 主分支 (O2O) 预测 ---
             inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
-                # === [修改 2] 计算 O2M Logits ===
-                if score_head_o2m is not None:
-                    dec_out_logits_o2m.append(score_head_o2m[i](output))
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
                     dec_out_bboxes.append(F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points)))
+
+                # --- 3. 辅助分支 (O2M) 解耦预测 ---
+                if ffn_o2m is not None:
+                    # (a) 特征解耦：使用 pre_ffn_feat 过独立的 O2M FFN，进入多目标特征空间
+                    o2m_feat = ffn_o2m[i](pre_ffn_feat)
+
+                    # (b) 共享预测头：复用主干的分类和回归头，由于特征空间已解耦，不再产生撕扯
+                    dec_out_logits_o2m.append(score_head[i](o2m_feat))
+
+                    if i == 0:
+                        # O2M 的回归同样基于主干解耦出的 ref_points_detach
+                        inter_ref_bbox_o2m = F.sigmoid(bbox_head[i](o2m_feat) + inverse_sigmoid(ref_points_detach))
+                        dec_out_bboxes_o2m.append(inter_ref_bbox_o2m)
+                    else:
+                        # 重点：O2M 的偏移基准必须是上一层主分支的 ref_points
+                        inter_ref_bbox_o2m = F.sigmoid(bbox_head[i](o2m_feat) + inverse_sigmoid(ref_points))
+                        dec_out_bboxes_o2m.append(inter_ref_bbox_o2m)
 
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
+            # --- 4. 【铁律】Reference points 只由主分支 (O2O) 更新 ---
             ref_points = inter_ref_bbox
-            ref_points_detach = inter_ref_bbox.detach(
-            ) if self.training else inter_ref_bbox
-        # === 返回 O2M Logits ===
-        if self.training and len(dec_out_logits_o2m) > 0:
-            return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), torch.stack(dec_out_logits_o2m)
+            ref_points_detach = inter_ref_bbox.detach() if self.training else inter_ref_bbox
 
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), None
+        if self.training and len(dec_out_logits_o2m) > 0:
+            return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), torch.stack(
+                dec_out_bboxes_o2m), torch.stack(dec_out_logits_o2m)
+
+        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), None, None
 
 
 @register
@@ -317,7 +357,7 @@ class RTDETRTransformer(nn.Module):
                  eps=1e-2, 
                  aux_loss=True,
                  use_density_query_selection=False,
-                 use_density_aux_loss=False,
+                 use_o2m=False,
                  density_weight_init=None):
 
         super(RTDETRTransformer, self).__init__()
@@ -338,8 +378,9 @@ class RTDETRTransformer(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
+
         self.use_density_query_selection = use_density_query_selection
-        self.use_density_aux_loss = use_density_aux_loss
+        self.use_o2m = use_o2m
 
         # === [新增] 定义层级密度权重为可学习参数 ===
         # 初始化为 [1.0, 0.1, 0.1]，对应 S3, S4, S5
@@ -386,11 +427,15 @@ class RTDETRTransformer(nn.Module):
             for _ in range(num_decoder_layers)
         ])
 
-        # === [修改 2] 仅当 use_density_aux_loss=True 时创建 O2M Head ===
-        if self.use_density_aux_loss:
-            self.dec_score_head_o2m = copy.deepcopy(self.dec_score_head)
+        # === [新增/修改] 独立实例化 O2M 分类头和回归头 ===
+        if self.use_o2m:
+            # 采用 1024 维度的标准 FFN，带残差和 LayerNorm
+            self.dec_ffn_o2m = nn.ModuleList([
+                O2M_FFN(hidden_dim, dim_feedforward, dropout, activation)
+                for _ in range(num_decoder_layers)
+            ])
         else:
-            self.dec_score_head_o2m = None
+            self.dec_ffn_o2m = None
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -410,11 +455,15 @@ class RTDETRTransformer(nn.Module):
             init.constant_(reg_.layers[-1].weight, 0)
             init.constant_(reg_.layers[-1].bias, 0)
 
-        # === [修改 3] 按需初始化 O2M Head ===
-        if self.use_density_aux_loss and self.dec_score_head_o2m is not None:
-            for cls_ in self.dec_score_head_o2m:
-                init.constant_(cls_.bias, bias)
-        
+        # === [新增] 初始化 O2M FFN 的参数 ===
+        if self.use_o2m and self.dec_ffn_o2m is not None:
+            for ffn_ in self.dec_ffn_o2m:
+                # 使用 Xavier 初始化保证初始梯度的稳定
+                init.xavier_uniform_(ffn_.linear1.weight)
+                init.constant_(ffn_.linear1.bias, 0)
+                init.xavier_uniform_(ffn_.linear2.weight)
+                init.constant_(ffn_.linear2.bias, 0)
+
         # linear_init_(self.enc_output[0])
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learnt_init_query:
@@ -743,76 +792,66 @@ class RTDETRTransformer(nn.Module):
 
         return target, reference_points_unact.detach(), enc_topk_bboxes, enc_topk_logits
 
-
     def forward(self, feats, samples, targets=None, density_map=None):
-
-        # input projection and embedding
         (memory, spatial_shapes, level_start_index) = self._get_encoder_input(feats)
-        
-        # prepare denoising training
+
         if self.training and self.num_denoising > 0:
             denoising_class, denoising_bbox_unact, attn_mask, dn_meta = \
-                get_contrastive_denoising_training_group(targets, \
-                    self.num_classes, 
-                    self.num_queries, 
-                    self.denoising_class_embed, 
-                    num_denoising=self.num_denoising, 
-                    label_noise_ratio=self.label_noise_ratio, 
-                    box_noise_scale=self.box_noise_scale, )
+                get_contrastive_denoising_training_group(targets, self.num_classes, self.num_queries,
+                                                         self.denoising_class_embed, num_denoising=self.num_denoising,
+                                                         label_noise_ratio=self.label_noise_ratio,
+                                                         box_noise_scale=self.box_noise_scale, )
         else:
             denoising_class, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
         target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits = \
-            self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets, density_map)
-        # === [修改 4] 传入 O2M Head (仅当训练且 flag=True 时) ===
-        score_head_o2m_input = self.dec_score_head_o2m if (self.training and self.use_density_aux_loss) else None
-        # decoder
-        # === [修改 6] 传入 dec_score_head_o2m ===
-        out_bboxes, out_logits, out_logits_o2m = self.decoder(
+            self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets,
+                                    density_map)
+
+        # === [修改] 仅传入额外的 O2M 解耦 FFN，不传 Head ===
+        ffn_o2m_input = self.dec_ffn_o2m if (self.training and self.use_o2m) else None
+
+        out_bboxes, out_logits, out_bboxes_o2m, out_logits_o2m = self.decoder(
             target,
             init_ref_points_unact,
             memory,
             spatial_shapes,
             level_start_index,
-            self.dec_bbox_head,
-            self.dec_score_head,
+            self.dec_bbox_head,  # 共享
+            self.dec_score_head,  # 共享
             self.query_pos_head,
             attn_mask=attn_mask,
             samples=samples,
             dn_meta=dn_meta,
-            score_head_o2m=score_head_o2m_input)
+            ffn_o2m=ffn_o2m_input)  # 仅传入特征解耦层
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
-            # === 如果有 O2M 输出，同样做 DN 切分 ===
-            if out_logits_o2m is not None:
+            if out_logits_o2m is not None and out_bboxes_o2m is not None:
                 _, out_logits_o2m = torch.split(out_logits_o2m, dn_meta['dn_num_split'], dim=2)
-
+                _, out_bboxes_o2m = torch.split(out_bboxes_o2m, dn_meta['dn_num_split'], dim=2)
 
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
             out['aux_outputs'].extend(self._set_aux_loss([enc_topk_logits], [enc_topk_bboxes]))
-            
+
             if self.training and dn_meta is not None:
                 out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
                 out['dn_meta'] = dn_meta
 
-        # === [修改 5] 封装 O2M 输出 (含中间层 Aux Outputs) ===
-        if self.training and out_logits_o2m is not None and self.use_density_aux_loss:
-            # 1. 最后一层输出
+        # === 封装 O2M 输出 ===
+        if self.training and out_logits_o2m is not None and out_bboxes_o2m is not None and self.use_o2m:
             out['o2m_outputs'] = {
                 'pred_logits': out_logits_o2m[-1],
-                'pred_boxes': out_bboxes[-1]
+                'pred_boxes': out_bboxes_o2m[-1]
             }
-            # 2. 中间层的 Aux Outputs (关键！)
             if self.aux_loss:
-                # 对应 MS-DETR 的 deep supervision
                 out['o2m_outputs']['aux_outputs'] = self._set_aux_loss(
                     out_logits_o2m[:-1],
-                    out_bboxes[:-1]  # Box 是共享的，直接用主分支
+                    out_bboxes_o2m[:-1]
                 )
 
         return out

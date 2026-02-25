@@ -35,9 +35,9 @@ class DensityGuidedMatcher(nn.Module):
         self.gamma = gamma
 
         # 代价系数
-        self.cost_class = weight_dict['cost_class']
-        self.cost_bbox = weight_dict['cost_bbox']
-        self.cost_giou = weight_dict['cost_giou']
+        self.cost_class = 2
+        self.cost_bbox = 5
+        self.cost_giou = 2
         self.cost_density = 1.0
 
     @torch.no_grad()
@@ -67,11 +67,10 @@ class DensityGuidedMatcher(nn.Module):
         indices = []
         cur_idx = 0
 
-        # === 【修正点1】归一化密度图 ===
-        # 你的 weights 最大有 5.0，如果不归一化，Cost 很容易爆炸
-        # 按每张图的最大值进行归一化，保持在 0-1 之间
-        max_vals = density_map.flatten(2).max(2)[0][..., None, None]  # [B, 1, 1, 1]
-        density_map_norm = density_map / (max_vals + 1e-6)
+        # === 【修改：移除动态最大值归一化，改为全局缩放】 ===
+        # 你的 GT 生成公式最大值约为 5.0 (1.0 + 4.0)。
+        # 为了让 density 在 0~1 之间且保留大小物体差异，除以固定值 5.0
+        density_map_norm = density_map / 5.0
 
         for i in range(bs):
             tgt_ids_i = targets[i]["labels"]
@@ -122,7 +121,7 @@ class DensityGuidedMatcher(nn.Module):
             matching_matrix = torch.zeros_like(C, dtype=torch.bool)
 
             for gt_idx in range(num_gt):
-                k = 6 if is_small[gt_idx] else 2
+                k = 6 if is_small[gt_idx] else 4
                 k = min(k, num_queries)
                 _, topk_indices = torch.topk(C[:, gt_idx], k, largest=False)
                 matching_matrix[topk_indices, gt_idx] = True
