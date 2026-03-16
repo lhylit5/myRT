@@ -52,7 +52,7 @@ class CoordAtt(nn.Module):
         a_w = self.conv_w(x_w).sigmoid()
 
         # 双向加权
-        out = identity * a_h * a_w
+        out = a_h * a_w
         return out
 
 
@@ -152,7 +152,6 @@ class SmallObjectEnhance(nn.Module):
         # 3. 特征增强 (Coordinate Attention)
         enhanced_S = S
         if self.use_feature_enhance:
-
             att_mask = self.coord_att(Fc)
             enhanced_S = S * (1.0 + self.alpha * att_mask)
 

@@ -272,7 +272,8 @@ class TransformerDecoder(nn.Module):
                 memory_mask=None,
                 samples=None,
                 dn_meta=None,
-                ffn_o2m=None):  # === [新增] 接收独立的 O2M 回归头 ===
+                ffn_o2m=None,
+                score_head_o2m=None):  # === [新增] 接收独立的 O2M 回归头 ===
         output = tgt
         dec_out_bboxes = []
         dec_out_logits = []
@@ -304,7 +305,8 @@ class TransformerDecoder(nn.Module):
                     o2m_feat = ffn_o2m[i](pre_ffn_feat)
 
                     # (b) 共享预测头：复用主干的分类和回归头，由于特征空间已解耦，不再产生撕扯
-                    dec_out_logits_o2m.append(score_head[i](o2m_feat))
+                    # dec_out_logits_o2m.append(score_head[i](o2m_feat))
+                    dec_out_logits_o2m.append(score_head_o2m[i](o2m_feat))
 
                     if i == 0:
                         # O2M 的回归同样基于主干解耦出的 ref_points_detach
@@ -434,8 +436,13 @@ class RTDETRTransformer(nn.Module):
                 O2M_FFN(hidden_dim, dim_feedforward, dropout, activation)
                 for _ in range(num_decoder_layers)
             ])
+            self.dec_score_head_o2m = nn.ModuleList([
+                nn.Linear(hidden_dim, num_classes)
+                for _ in range(num_decoder_layers)
+            ])
         else:
             self.dec_ffn_o2m = None
+            self.dec_score_head_o2m = None
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -463,6 +470,9 @@ class RTDETRTransformer(nn.Module):
                 init.constant_(ffn_.linear1.bias, 0)
                 init.xavier_uniform_(ffn_.linear2.weight)
                 init.constant_(ffn_.linear2.bias, 0)
+        if self.use_o2m and self.dec_score_head_o2m is not None:
+            for cls_ in self.dec_score_head_o2m:
+                init.constant_(cls_.bias, bias)
 
         # linear_init_(self.enc_output[0])
         init.xavier_uniform_(self.enc_output[0].weight)
@@ -810,6 +820,7 @@ class RTDETRTransformer(nn.Module):
 
         # === [修改] 仅传入额外的 O2M 解耦 FFN，不传 Head ===
         ffn_o2m_input = self.dec_ffn_o2m if (self.training and self.use_o2m) else None
+        score_head_o2m_input = self.dec_score_head_o2m if (self.training and self.use_o2m) else None
 
         out_bboxes, out_logits, out_bboxes_o2m, out_logits_o2m = self.decoder(
             target,
@@ -818,12 +829,13 @@ class RTDETRTransformer(nn.Module):
             spatial_shapes,
             level_start_index,
             self.dec_bbox_head,  # 共享
-            self.dec_score_head,  # 共享
+            self.dec_score_head,
             self.query_pos_head,
             attn_mask=attn_mask,
             samples=samples,
             dn_meta=dn_meta,
-            ffn_o2m=ffn_o2m_input)  # 仅传入特征解耦层
+            ffn_o2m=ffn_o2m_input,
+            score_head_o2m=score_head_o2m_input)  # 仅传入特征解耦层
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)

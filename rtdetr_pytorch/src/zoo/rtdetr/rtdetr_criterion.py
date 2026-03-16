@@ -46,25 +46,38 @@ def reduce_mean(tensor):
         dist.all_reduce(tensor)  # 默认是 Sum 操作
         return tensor / world_size
 
+
 @register
 class TaskAlignedDynamicKMatcher(nn.Module):
     """
-    专为 RT-DETR 一对多辅助分支设计的动态 K 值匹配器。
-    基于分类得分与 IoU 的高阶乘积进行任务对齐，动态计算每一个 GT 的最优正样本。
+    支持消融实验的多功能 O2M 匹配器。
+    可以通过开关控制：
+    1. use_task_align: True 使用任务对齐分数 (你的创新点) / False 使用 MS-DETR 的传统 Cost 矩阵
+    2. use_dynamic_k: True 使用动态 K 值 (你的创新点) / False 使用固定 K 值
     """
-    def __init__(self, alpha=1.0, beta=1.0, topk_candidates=10, max_k=7):
+
+    def __init__(self,
+                 alpha=1.0, beta=1.0, topk_candidates=10, max_k=7,
+                 use_task_align=False,  # <--- 消融实验开关 1
+                 use_dynamic_k=True,  # <--- 消融实验开关 2
+                 fixed_k=6):  # <--- 如果不用动态 K，固定的 K 值设为多少
         super().__init__()
-        self.alpha = alpha   # 分类得分权重
-        self.beta = beta     # IoU 权重
-        self.topk_candidates = topk_candidates # 计算动态 K 值时的候选池
-        self.max_k = max_k   # 大目标最多分配的 Query 数量
+        self.alpha = alpha
+        self.beta = beta
+        self.topk_candidates = topk_candidates
+        self.max_k = max_k
+
+        # 消融实验参数
+        self.use_task_align = use_task_align
+        self.use_dynamic_k = use_dynamic_k
+        self.fixed_k = fixed_k
 
     @torch.no_grad()
     def forward(self, outputs, targets):
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         out_prob = outputs["pred_logits"].sigmoid()  # [B, num_queries, num_classes]
-        out_bbox = outputs["pred_boxes"]             # [B, num_queries, 4]
+        out_bbox = outputs["pred_boxes"]  # [B, num_queries, 4]
 
         indices = []
         for b in range(bs):
@@ -77,43 +90,71 @@ class TaskAlignedDynamicKMatcher(nn.Module):
             tgt_bbox = targets[b]["boxes"]
             num_gt = len(tgt_ids)
 
-            # 1. 提取当前预测框对真实类别的概率
+            # 提取概率与计算 IoU (两种方法都需要用到)
             pred_prob = out_prob[b]
-            cls_scores = pred_prob[:, tgt_ids] # [num_queries, num_gt]
-
-            # 2. 计算 IoU
+            cls_scores = pred_prob[:, tgt_ids]
             iou, _ = box_iou(box_cxcywh_to_xyxy(out_bbox[b]), box_cxcywh_to_xyxy(tgt_bbox))
 
-            # === [优化] 3. 任务对齐得分 (加入 eps 防止冷启动阶段全 0 导致的随机匹配) ===
-            # 让 iou 为 0 时，分类得分较高的预测框依然能脱颖而出
-            align_metric = (cls_scores ** self.alpha) * ((iou.clamp(min=0) + 1e-6) ** self.beta)
+            # =======================================================
+            # === 消融维度 1：任务对齐 (Task Alignment) vs 传统 Cost ===
+            # =======================================================
+            if self.use_task_align:
+                # [你的创新点] 任务对齐得分 (越大越好)
+                align_metric = (cls_scores ** self.alpha) * ((iou.clamp(min=0) + 1e-6) ** self.beta)
 
-            # === [优化] 引入空间先验 (可选但推荐)：只允许中心点在 GT 附近的 Query 成为正样本 ===
-            # 计算预测框中心点与 GT 中心点的 L2 距离
-            out_cxcy = out_bbox[b][:, :2]
-            tgt_cxcy = tgt_bbox[:, :2]
-            dist = torch.cdist(out_cxcy, tgt_cxcy)
-            align_metric = align_metric / (dist + 1e-6) # 距离越远，惩罚越大
+                # 引入空间先验 (防冷启动)
+                out_cxcy = out_bbox[b][:, :2]
+                tgt_cxcy = tgt_bbox[:, :2]
+                dist = torch.cdist(out_cxcy, tgt_cxcy)
+                align_metric = align_metric / (dist + 1e-6)
+            else:
+                # [Baseline] 类似 MS-DETR，计算传统的 Matching Cost (包含类别 Focal Cost, L1, GIoU)
+                # 1. Focal Loss Cost
+                alpha_focal = 0.25
+                gamma_focal = 2.0
+                neg_cost_class = (1 - alpha_focal) * (pred_prob ** gamma_focal) * (-(1 - pred_prob + 1e-8).log())
+                pos_cost_class = alpha_focal * ((1 - pred_prob) ** gamma_focal) * (-(pred_prob + 1e-8).log())
+                cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
 
-            # 4. 动态 K 值计算 (Scale-Aware)
-            topk_iou, _ = torch.topk(iou, min(self.topk_candidates, num_queries), dim=0)
-            dynamic_ks = torch.clamp(topk_iou.sum(0).int(), min=1, max=self.max_k) # [num_gt]
+                # 2. BBox L1 Cost
+                cost_bbox = torch.cdist(out_bbox[b], tgt_bbox, p=1)
 
-            # 5. 建立匹配矩阵，解决冲突 (一个 Query 最好只匹配一个 GT)
+                # 3. GIoU Cost
+                cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[b]), box_cxcywh_to_xyxy(tgt_bbox))
+
+                # 融合 Cost (依照 DETR 默认权重: cls=2.0, bbox=5.0, giou=2.0)
+                cost_matrix = 2.0 * cost_class + 5.0 * cost_bbox + 2.0 * cost_giou
+
+                # 因为后面的代码都是“越大越好 (largest=True)”，所以这里对 Cost 取负数
+                align_metric = -cost_matrix
+
+            # =======================================================
+            # === 消融维度 2：动态 K (Dynamic-K) vs 固定 K (Fixed-K) ===
+            # =======================================================
+            if self.use_dynamic_k:
+                # [你的创新点] 动态 K 值计算
+                topk_iou, _ = torch.topk(iou, min(self.topk_candidates, num_queries), dim=0)
+                dynamic_ks = torch.clamp(topk_iou.sum(0).int(), min=1, max=self.max_k)
+            else:
+                # [Baseline] 固定 K 值分配
+                dynamic_ks = torch.full((num_gt,), self.fixed_k, dtype=torch.int32, device=out_prob.device)
+
+            # =======================================================
+            # === 后续分配逻辑 (保持一致，方便公平对比) ===
+            # =======================================================
             matching_matrix = torch.zeros_like(align_metric, dtype=torch.bool)
 
             for gt_idx in range(num_gt):
                 k = dynamic_ks[gt_idx].item()
-                _, topk_idx = torch.topk(align_metric[:, gt_idx], k, largest=True)
+                _, topk_idx = torch.topk(align_metric[:, gt_idx], k, largest=True)  # align_metric 越大代表匹配越好
                 matching_matrix[topk_idx, gt_idx] = True
 
-            # 6. 处理冲突：如果一个 Query 同时被多个 GT 选中，保留对齐得分最高的那一个
+            # 处理冲突：保留 align_metric 最高的
             anchor_matching_gt = matching_matrix.sum(1)
             if (anchor_matching_gt > 1).sum() > 0:
                 conflict_indices = torch.where(anchor_matching_gt > 1)[0]
                 for c_idx in conflict_indices:
                     matched_gts = torch.where(matching_matrix[c_idx])[0]
-                    # 找到得分最高的 GT 保留
                     best_gt = matched_gts[torch.argmax(align_metric[c_idx, matched_gts])]
                     matching_matrix[c_idx] = False
                     matching_matrix[c_idx, best_gt] = True
@@ -123,6 +164,7 @@ class TaskAlignedDynamicKMatcher(nn.Module):
             indices.append((src_ind, tgt_ind))
 
         return indices
+
 @register
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
@@ -930,7 +972,7 @@ def generate_targets_and_weights_adaptive(targets, feat_shape, device, threshold
 
         # === 4. 权重计算 (保持之前的强力加权) ===
         scale_factor = 100.0
-        box_weights = 1.0 + 4 * torch.exp(-valid_areas * scale_factor)
+        box_weights = 1.0 + 0 * torch.exp(-valid_areas * scale_factor)
         box_weights = box_weights.view(N, 1) * is_in_box.float()
 
         # === 5. 聚合 ===

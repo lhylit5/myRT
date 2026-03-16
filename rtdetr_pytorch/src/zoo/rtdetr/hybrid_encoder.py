@@ -5,24 +5,24 @@ import copy
 from typing import Tuple
 
 import torch
-import torch.nn as nn 
-import torch.nn.functional as F 
+import torch.nn as nn
+import torch.nn.functional as F
 
 from .utils import get_activation
 
 from src.core import register
-
 
 __all__ = ['HybridEncoder']
 
 from .visualize import visualize_features
 
 # # 在文件顶部加上 import
-try:
-    # 调整为你的实际路径
-    from .new_small_enhance import SmallObjectEnhance
-except Exception:
-    from src.models.new_small_enhance import SmallObjectEnhance
+from .soem import SmallObjectEnhance # noqa: F401
+# try:
+#     # 调整为你的实际路径
+#     from .soem import SmallObjectEnhance
+# except Exception:
+#     from src.models.new_small_enhance import SmallObjectEnhance
 # try:
 #     # 调整为你的实际路径
 #     from .small_object_enhance import SmallObjectEnhance

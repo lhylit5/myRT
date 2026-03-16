@@ -10,7 +10,7 @@ try:
 except Exception:
     def register(cls): return cls
 
-__all__ = ['SmallObjectEnhance']
+__all__ = ['SmallObjectEnhance_old']
 
 
 # ----------------------------
