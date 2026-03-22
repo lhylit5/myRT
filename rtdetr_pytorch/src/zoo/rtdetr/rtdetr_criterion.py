@@ -99,14 +99,47 @@ class TaskAlignedDynamicKMatcher(nn.Module):
             # === 消融维度 1：任务对齐 (Task Alignment) vs 传统 Cost ===
             # =======================================================
             if self.use_task_align:
-                # [你的创新点] 任务对齐得分 (越大越好)
-                align_metric = (cls_scores ** self.alpha) * ((iou.clamp(min=0) + 1e-6) ** self.beta)
+                #  任务对齐得分 (越大越好)
+                # align_metric = (cls_scores ** self.alpha) * ((iou.clamp(min=0) + 1e-6) ** self.beta)
+                # # 引入空间先验 (防冷启动)
+                # out_cxcy = out_bbox[b][:, :2]
+                # tgt_cxcy = tgt_bbox[:, :2]
+                # dist = torch.cdist(out_cxcy, tgt_cxcy)
+                # align_metric = align_metric / (dist + 1e-6)
 
-                # 引入空间先验 (防冷启动)
+                # 1. 提取预测框和真实框的中心点
                 out_cxcy = out_bbox[b][:, :2]
                 tgt_cxcy = tgt_bbox[:, :2]
+                # 2. 计算中心点欧氏距离矩阵 [num_queries, num_gt]
                 dist = torch.cdist(out_cxcy, tgt_cxcy)
-                align_metric = align_metric / (dist + 1e-6)
+                # 3. 计算真实目标框(GT)的归一化面积 [num_gt]
+                gt_areas = tgt_bbox[:, 2] * tgt_bbox[:, 3]
+                # 4. 构建尺度自适应的高斯核 (Scale-Adaptive Gaussian Kernel)
+                # 目标越小，高斯核相对其面积就越宽容 (sigma 决定了高斯山的胖瘦)
+                # clamp(min=1e-4) 是为了防止极小目标导致除以零
+                sigma = torch.clamp(torch.sqrt(gt_areas) * 0.5, min=1e-4)
+                # 5. 计算高斯空间相似度 (Gaussian Similarity)
+                # 结果在 0 到 1 之间。距离越近越接近1，距离越远平滑衰减到0
+                gaussian_sim = torch.exp(- (dist ** 2) / (2 * sigma ** 2))
+                # 6. 计算 Scale-Adaptive Gaussian Compensated IoU  (核心创新：空间相似度补偿)
+                # 初始化 sgc_iou 为真实的 iou
+                sgc_iou = iou.clone().clamp(min=0)
+                # 筛选出微小目标
+                threshold = 0.01
+                is_small = gt_areas < threshold
+                # 对微小目标应用 "sgc_iou" 融合
+                # 即使真实 IoU 为 0，只要空间距离近(gaussian_sim>0)，依然能获得基础得分
+                # 这里的 0.5 是权重，表示真实 IoU 和空间相似度各占一半
+                if is_small.any():
+                    # 计算动态权重: 目标越小，高斯权重越大；目标接近 threshold，高斯权重接近 0
+                    # 比如：面积为 0，权重为 0.5；面积为 0.04，权重为 0
+                    gauss_weight = 0.5 * (1.0 - gt_areas[is_small] / threshold)
+                    iou_weight = 1.0 - gauss_weight
+                    # 动态融合
+                    sgc_iou[:, is_small] = iou_weight * iou[:, is_small].clamp(min=0) + gauss_weight * gaussian_sim[:, is_small]
+                # 7. 计算最终的任务对齐得分 (Task Alignment Metric)
+                # 完全摒弃分母的刚性距离惩罚，采用软化后的 sgc_iou
+                align_metric = (cls_scores ** self.alpha) * ((sgc_iou + 1e-6) ** self.beta)
             else:
                 # [Baseline] 类似 MS-DETR，计算传统的 Matching Cost (包含类别 Focal Cost, L1, GIoU)
                 # 1. Focal Loss Cost
@@ -212,198 +245,8 @@ class SetCriterion(nn.Module):
                 o2m_weight_dict[f"{k}_o2m"] = v
             self.weight_dict.update(o2m_weight_dict)
 
-    def loss_density3(self, outputs, targets, indices, num_boxes, **kwargs):
-        """
-        【最终优化版】Weighted QFL + Box-Aware Labels + DDP Norm
-        """
-        if 'pred_density_map' not in outputs:
-            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
-
-        src_map = outputs['pred_density_map']  # [B, 1, H, W]
-        device = src_map.device
-
-        # 1. 数值稳定性保护
-        src_map = torch.clamp(src_map, min=1e-6, max=1.0 - 1e-6)
-
-        # 2. 获取 Target Map 和 Weight Map (一步完成)
-        # 如果 kwargs 里有缓存（例如在 Dataset 里算好的），直接用
-        # 否则在线计算（现在这个在线计算非常快）
-        if 'gt_density_map' in kwargs and 'gt_weight_map' in kwargs:
-            target_map = kwargs['gt_density_map']
-            weight_map = kwargs['gt_weight_map']
-            # 注意：如果从外部传，需要确保外部也传了 num_valid_objects，否则这里得重新算或估算
-            # 鉴于你是在线算，这里主要走 else 分支
-            total_valid_objects = kwargs.get('num_valid_objects', 1.0)
-        else:
-            with torch.no_grad():
-                target_map, weight_map, total_valid_objects = generate_targets_and_weights(
-                    targets,
-                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
-                    device,
-                    decay_beta=0.5  # 推荐 0.3-0.5，让小目标高分区域更宽
-                )
-
-        # 3. 计算 QFL (Weighted)
-        beta = 2.0
-        scale = torch.abs(target_map - src_map) ** beta
-        loss_bce = F.binary_cross_entropy(src_map, target_map, reduction='none')
-
-        # 分子：加权求和
-        loss_unnormalized = (weight_map * scale * loss_bce).sum()
-
-        # 4. DDP 全局归一化
-        # 将本地 count 转为 Tensor
-        num_valid_objects = torch.tensor(total_valid_objects, dtype=torch.float, device=device)
-
-        # 多卡同步求平均
-        global_avg_objects = reduce_mean(num_valid_objects)
-
-        # 极小值保护
-        pos_normalizer = torch.clamp(global_avg_objects, min=1.0)
-
-        # 5. 返回最终 Loss
-        # 建议系数 2.0
-        return {'loss_density': (loss_unnormalized / pos_normalizer)}
-
-    def loss_density3(self, outputs, targets, indices, num_boxes, **kwargs):
-        """
-        【适配 Sigmoid + 尺度约束版】计算加权 BCE Loss。
-        Target: 0~1 (大目标区域为 0)
-        Weight: 1.0 (背景/大目标) ~ 4.0 (小目标)
-        """
-        if 'pred_density_map' not in outputs:
-            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
-
-        src_map = outputs['pred_density_map']  # [B, 1, H, W] (已经是 0~1)
-
-        # 1. 获取 Target Map (0~1, 大目标已过滤为 0)
-        if 'gt_density_map' in kwargs:
-            target_map = kwargs['gt_density_map']
-        else:
-            with torch.no_grad():
-                target_map = generate_density_map_gt_2(
-                    targets,
-                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
-                    src_map.device
-                )
-
-        # 2. 动态生成 Pixel-wise Loss 权重图
-        B, C, H, W = src_map.shape
-        weight_map = torch.ones_like(target_map)  # 默认为 1.0 (背景权重)
-
-        for i in range(B):
-            if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
-                continue
-
-            boxes = targets[i]['boxes']
-            areas = boxes[:, 2] * boxes[:, 3]
-
-            # === [同步修改] 尺度过滤 ===
-            # 在计算权重时，同样忽略大目标。
-            # 让大目标区域的权重保持默认的 1.0 (背景权重)，迫使模型将其预测为 0。
-            # 阈值必须与 GT 生成函数保持一致 (0.04)
-            is_valid_scale = areas < 0.04
-
-            if not is_valid_scale.any():
-                continue
-
-            valid_boxes = boxes[is_valid_scale]
-            valid_areas = areas[is_valid_scale]
-
-            # 计算每个框的权重值
-            scale_factor = 100.0
-            # 权重公式：小目标权重高 (~4.0)，大目标(如果没过滤)权重低 (~1.0)
-            box_weights = 1.0 + 3.0 * torch.exp(-valid_areas * scale_factor)
-
-            # 将权重填入对应的框区域
-            feat_boxes = valid_boxes * torch.tensor([W, H, W, H], device=src_map.device)
-            feat_boxes = box_cxcywh_to_xyxy(feat_boxes).long()
-
-            # 限制坐标在图像内
-            feat_boxes[:, 0::2].clamp_(0, W - 1)
-            feat_boxes[:, 1::2].clamp_(0, H - 1)
-
-            for k in range(len(valid_boxes)):
-                x1, y1, x2, y2 = feat_boxes[k]
-                w_val = box_weights[k]
-                # 处理重叠区域，保留最大权重
-                current_roi = weight_map[i, 0, y1:y2 + 1, x1:x2 + 1]
-                weight_map[i, 0, y1:y2 + 1, x1:x2 + 1] = torch.maximum(current_roi, w_val)
-
-        # 3. 计算加权 BCE Loss
-        loss = F.binary_cross_entropy(src_map, target_map, reduction='none')
-
-        # 应用权重并求平均
-        loss = (loss * weight_map).mean()
-
-        return {'loss_density': loss}
 
     # === 【新增 2】密度 Loss 计算函数 ===
-    def loss_density2(self, outputs, targets, indices, num_boxes, **kwargs):
-        """
-        【适配 Sigmoid 版】计算加权 BCE Loss。
-        Target: 0~1
-        Input: 0~1 (Sigmoid processed)
-        Weight: 1.0 (Background) ~ 5.0 (Small Object) applied to Loss
-        """
-        if 'pred_density_map' not in outputs:
-            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
-
-        src_map = outputs['pred_density_map']  # [B, 1, H, W] (已经是 0~1)
-
-        # 1. 获取 Target Map (0~1)
-        if 'gt_density_map' in kwargs:
-            target_map = kwargs['gt_density_map']
-        else:
-            with torch.no_grad():
-                # 使用修正后的 GT 生成函数
-                target_map = generate_density_map_gt_2(
-                    targets,
-                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
-                    src_map.device
-                )
-
-        # 2. 动态生成 Pixel-wise Loss 权重图
-        B, C, H, W = src_map.shape
-        weight_map = torch.ones_like(target_map)  # 默认为 1.0 (背景权重)
-
-        for i in range(B):
-            if 'boxes' not in targets[i] or len(targets[i]['boxes']) == 0:
-                continue
-
-            boxes = targets[i]['boxes']
-            # 计算每个框的权重值
-            areas = boxes[:, 2] * boxes[:, 3]
-            scale_factor = 100.0
-            # 权重公式：小目标权重高 (~5.0)，大目标权重低 (~1.0)
-            box_weights = 1.0 + 3.0 * torch.exp(-areas * scale_factor)
-
-            # 将权重填入对应的框区域
-            # 将归一化坐标转为特征图坐标
-            feat_boxes = boxes * torch.tensor([W, H, W, H], device=src_map.device)
-            feat_boxes = box_cxcywh_to_xyxy(feat_boxes).long()
-
-            # 限制坐标在图像内
-            feat_boxes[:, 0::2].clamp_(0, W - 1)
-            feat_boxes[:, 1::2].clamp_(0, H - 1)
-
-            for k in range(len(boxes)):
-                x1, y1, x2, y2 = feat_boxes[k]
-                w_val = box_weights[k]
-                # 处理重叠区域，保留最大权重 (即保留对小目标的关注)
-                current_roi = weight_map[i, 0, y1:y2 + 1, x1:x2 + 1]
-                weight_map[i, 0, y1:y2 + 1, x1:x2 + 1] = torch.maximum(current_roi, w_val)
-
-        # 3. 计算加权 BCE Loss
-        # 注意：src_map 已经是 Sigmoid 过的，所以用 binary_cross_entropy
-        # reduction='none' 以便应用权重
-        loss = F.binary_cross_entropy(src_map, target_map, reduction='none')
-
-        # 应用权重并求平均
-        loss = (loss * weight_map).mean()
-
-        return {'loss_density': loss}
-
     def loss_density(self, outputs, targets, indices, num_boxes, **kwargs):
         """
         【Focal Loss 版】Density Loss

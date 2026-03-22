@@ -47,10 +47,10 @@ def extract_test_results(input_file, output_file):
 if __name__ == "__main__":
     # ================= 配置区域 =================
     # 输入的日志文件名 (你之前的训练日志)
-    INPUT_LOG = "E:\experiment\Base_72epo\\train.log"
+    INPUT_LOG = "E:\experiment\8card\\trainqs_mix.log"
 
     # 输出的日志文件名 (提取后的结果)
-    OUTPUT_LOG = "test_results.log"
+    OUTPUT_LOG = "traino2m_nta_ndk_results.log"
     # ===========================================
 
     extract_test_results(INPUT_LOG, OUTPUT_LOG)

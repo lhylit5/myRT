@@ -120,14 +120,14 @@ class DSAM(nn.Module):
 
 @register
 class SmallObjectEnhance(nn.Module):
-    def __init__(self, in_ch=256, mid_ch=512, out_ch=256, use_feature_enhance=True):
+    def __init__(self, in_ch=256, mid_ch=256, out_ch=256, use_feature_enhance=True):
         super().__init__()
         self.use_feature_enhance = use_feature_enhance
 
 
         self.dsam = DSAM(in_ch, mid_ch, out_ch, dilation_list=[1, 2, 4])
-
-        self.coord_att = CoordAtt(out_ch, out_ch)
+        if self.use_feature_enhance:
+            self.coord_att = CoordAtt(out_ch, out_ch)
 
         # 密度图预测头
         self.density_head = nn.Conv2d(out_ch, 1, 1)

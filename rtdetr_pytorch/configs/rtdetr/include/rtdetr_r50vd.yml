@@ -48,7 +48,7 @@ HybridEncoder:
 SmallObjectEnhance:
   _name: SmallObjectEnhance
   in_ch: 256
-  mid_ch: 512
+  mid_ch: 256
   out_ch: 256
 #  ccm_cfg: [512, 512, 256, 256]
 #  dilation: 2
@@ -68,11 +68,11 @@ RTDETRTransformer:
   eval_idx: -1
   eval_spatial_size: [640, 640]
 
-  use_density_query_selection: False
-  density_weight_init: [1.0, 0.3, 0.1]
+  use_density_query_selection: True
+#  density_weight_init: [1.0, 0.3, 0.1]
 
 # one_to_many
-  use_o2m: True
+  use_o2m: False
 
 
 
@@ -88,7 +88,7 @@ SetCriterion:
   alpha: 0.75
   gamma: 2.0
 # one_to_many
-  use_o2m: True
+  use_o2m: False
 
   matcher:
     type: HungarianMatcher

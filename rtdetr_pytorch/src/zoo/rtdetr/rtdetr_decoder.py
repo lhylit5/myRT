@@ -387,8 +387,6 @@ class RTDETRTransformer(nn.Module):
         # === [新增] 定义层级密度权重为可学习参数 ===
         # 初始化为 [1.0, 0.1, 0.1]，对应 S3, S4, S5
         # 这样网络初始状态会偏向 S3，但后续可以自动调整 S4/S5 的重要性
-        if self.use_density_query_selection:
-            self.level_density_scales = nn.Parameter(torch.tensor(density_weight_init, dtype=torch.float32))
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -654,118 +652,7 @@ class RTDETRTransformer(nn.Module):
         else:
             # 原始逻辑
             _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
-        # if self.use_density_query_selection and density_map is not None:
-        #     # 只有在开启开关，且密度图存在时才执行 (训练期或推理期均可)
-        #     num_queries = self.num_queries  # 300
-        #     num_rescue = 40  # 救援名额 (可以调，比如 50~100)
-        #     num_base = num_queries - num_rescue  # 250
-        #     # 1. 原始分类分数 (Sigmoid)
-        #     enc_probs = enc_outputs_class.sigmoid()
-        #     topk_score_cls = enc_probs.max(-1).values  # [B, Total_Anchors]
-        #
-        #     # --- 1. 准备数据 ---
-        #     # 原始分类分数
-        #     density_map = density_map.sigmoid()
-        #     enc_probs = enc_outputs_class.sigmoid()
-        #     topk_score_cls = enc_probs.max(-1).values  # [B, Total]
-        #
-        #     # S3 密度分数
-        #     s3_h, s3_w = spatial_shapes[0]
-        #     num_s3 = s3_h * s3_w
-        #
-        #     # 展平密度图
-        #     density_score = density_map.flatten(2).permute(0, 2, 1)  # [B, S3_Token, 1]
-        #
-        #     # 构建全尺度密度分数 (S4/S5 为 -1，确保不被选中)
-        #     total_anchors = enc_outputs_class.shape[1]
-        #     # 初始化为 -1.0 (负分，确保排序垫底)
-        #     full_density_score = torch.full((bs, total_anchors), -1.0,
-        #                                     device=enc_outputs_class.device,
-        #                                     dtype=enc_outputs_class.dtype)
-        #
-        #     if total_anchors >= num_s3:
-        #         # 填充 S3 部分 (应用 valid_mask 防止边缘噪声)
-        #         # 注意：这里不需要 learnable_scale，直接用原始概率值排序即可
-        #         valid_mask_s3 = valid_mask[:, :num_s3, 0]
-        #         # 将被 mask 掉的区域设为 -1
-        #         clean_s3_score = density_score.squeeze(-1) * valid_mask_s3
-        #         clean_s3_score = torch.where(valid_mask_s3 > 0, clean_s3_score,
-        #                                      torch.tensor(-1.0, device=clean_s3_score.device))
-        #
-        #         full_density_score[:, :num_s3] = clean_s3_score
-        #
-        #     # --- 2. 赛道一：保底组 (Base Group) ---
-        #     # 选 Top-250
-        #     _, base_inds = torch.topk(topk_score_cls, num_base, dim=1)  # [B, 250]
-        #
-        #     # --- 3. 赛道二：救援组 (Rescue Group) ---
-        #     # 为了避免重复，我们可以先把已经入选 Base 组的位置在密度分数里剔除
-        #     # (将已选位置的密度分设为 -2)
-        #     mask_density = full_density_score.clone()
-        #     # scatter_: 将 base_inds 对应位置的分数设为 -2
-        #     mask_density.scatter_(1, base_inds, -2.0)
-        #
-        #     # 从剩下的里面选密度最高的 50 个 S3 Token
-        #     _, rescue_inds = torch.topk(mask_density, num_rescue, dim=1)  # [B, 50]
-        #
-        #     # --- 4. 合并 (Union) ---
-        #     topk_ind = torch.cat([base_inds, rescue_inds], dim=1)  # [B, 300]
-        #
-        # else:
-        #     # 原始逻辑
-        #     _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
-
-
-        # if self.use_density_query_selection and density_map is not None:
-        #     # --- Step 1: 准备 S3 密度分 ---
-        #     # spatial_shapes[0] 对应 S3 (Stride 8)
-        #     s3_h, s3_w = spatial_shapes[0]
-        #     num_s3_queries = s3_h * s3_w
-        #
-        #     # density_map 已经是 [B, 1, H, W] 且经过 Sigmoid (0~1)
-        #     # 直接展平: [B, 1, H, W] -> [B, H*W, 1]
-        #     density_score_s3 = density_map.flatten(2).permute(0, 2, 1)
-        #
-        #     # --- Step 2: 构建全尺度密度容器 (S4/S5 默认为 0) ---
-        #     total_anchors = enc_outputs_class.shape[1]
-        #     full_density_score = torch.zeros((bs, total_anchors, 1),
-        #                                      device=enc_outputs_class.device,
-        #                                      dtype=enc_outputs_class.dtype)
-        #
-        #     # --- Step 3: S3 独占填充 ---
-        #     if total_anchors >= num_s3_queries:
-        #         # 获取 S3 的可学习权重 (确保为正)
-        #         # 兼容性处理：如果没有定义该参数，默认给 1.0
-        #         if hasattr(self, 'level_density_scales'):
-        #             scale_weight = self.level_density_scales[0].abs()
-        #         else:
-        #             scale_weight = 1.0
-        #
-        #         # 填充 S3 部分，并应用 Valid Mask (关键！防止 Padding 区域加分)
-        #         # valid_mask: [B, Total, 1] -> 切片取 S3 部分
-        #         valid_mask_s3 = valid_mask[:, :num_s3_queries, :]
-        #         full_density_score[:, :num_s3_queries, :] = density_score_s3 * scale_weight * valid_mask_s3
-        #
-        #     # --- Step 4: 门控融合 (Gated Fusion) ---
-        #     # 基础分类分数 (Sigmoid 归一化)
-        #     enc_probs = enc_outputs_class.sigmoid()
-        #     topk_score_cls = enc_probs.max(-1).values  # [B, Total]
-        #
-        #     # [关键] 置信度门控：只有看起来稍微像物体的 (score > 0.05)，才允许获得密度加成
-        #     # 这能有效防止纯背景噪声 (score~0.001) 被密度图误检强行抬高
-        #     gating_threshold = 0.05
-        #     score_mask = (topk_score_cls > gating_threshold).float()
-        #
-        #     # 融合公式：Score = Cls + Density * Mask
-        #     density_bonus = full_density_score.squeeze(-1) * score_mask
-        #     mixed_score = topk_score_cls + density_bonus
-        #
-        #     # --- Step 5: Top-K 筛选 ---
-        #     _, topk_ind = torch.topk(mixed_score, self.num_queries, dim=1)
-        #
-        # else:
-        #     # 原始逻辑：仅基于分类分数
-        #     _, topk_ind = torch.topk(enc_outputs_class.max(-1).values, self.num_queries, dim=1)
+       
 
         reference_points_unact = enc_outputs_coord_unact.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_coord_unact.shape[-1]))
@@ -800,7 +687,7 @@ class RTDETRTransformer(nn.Module):
         if denoising_class is not None:
             target = torch.concat([denoising_class, target], 1)
 
-        return target, reference_points_unact.detach(), enc_topk_bboxes, enc_topk_logits
+        return target, reference_points_unact.detach(), enc_topk_bboxes, enc_topk_logits, topk_ind
 
     def forward(self, feats, samples, targets=None, density_map=None):
         (memory, spatial_shapes, level_start_index) = self._get_encoder_input(feats)
@@ -814,7 +701,7 @@ class RTDETRTransformer(nn.Module):
         else:
             denoising_class, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
-        target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits = \
+        target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits, topk_ind = \
             self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact, samples, targets,
                                     density_map)
 
@@ -844,7 +731,7 @@ class RTDETRTransformer(nn.Module):
                 _, out_logits_o2m = torch.split(out_logits_o2m, dn_meta['dn_num_split'], dim=2)
                 _, out_bboxes_o2m = torch.split(out_bboxes_o2m, dn_meta['dn_num_split'], dim=2)
 
-        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'topk_indexes': topk_ind}
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
