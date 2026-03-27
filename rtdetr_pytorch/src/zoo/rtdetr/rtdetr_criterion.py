@@ -304,77 +304,7 @@ class SetCriterion(nn.Module):
         # 观察：如果 Loss 值过小(如 1e-3)，可以乘以一个系数 (e.g., * 5.0) 来平衡 Total Loss
         return {'loss_density': loss_weighted.sum() / normalizer}
 
-    def loss_density_MSE2(self, outputs, targets, indices, num_boxes, **kwargs):
-        """
-        【最终修正版】Weighted MSE + Target Mass Normalization
-        既解决了大小物体平衡，又避免了背景稀释梯度。
-        """
-        if 'pred_density_map' not in outputs:
-            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
-
-        pred_logits = outputs['pred_density_map']
-
-        # 1. 获取 Target 和 Weight
-        if 'gt_density_map' in kwargs:
-            target_map = kwargs['gt_density_map']
-            weight_map = kwargs['gt_weight_map']
-        else:
-            with torch.no_grad():
-                target_map, weight_map = generate_targets_and_weights_adaptive(
-                    targets, pred_logits.shape, pred_logits.device, 0.02
-                )
-
-        # 2. Logits -> Sigmoid -> MSE
-        pred_score = pred_logits.sigmoid()
-        loss_pixel = F.mse_loss(pred_score, target_map, reduction='none')
-
-        # 3. 加权 (你的小目标权重策略)
-        loss_weighted = loss_pixel * weight_map
-
-        # 4. 【核心修正】归一化：除以 Target 的总和 (Target Mass)
-        # 含义：平均每个"正样本强度单位"的误差
-        # 优点：
-        #   1. 背景 Target=0，不占分母，不会稀释梯度。
-        #   2. 大物体 Target Sum 大，Loss 被除得更多；小物体 Target Sum 小，Loss 保留更多。天然平衡！
-
-        normalizer = target_map.sum()
-
-        # DDP 同步
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(normalizer)
-            normalizer = normalizer / dist.get_world_size()
-
-        # 极小值保护 (防止全是背景时除以0)
-        normalizer = torch.clamp(normalizer, min=1.0)
-
-        # 5. 系数
-        # 这种归一化方式下，Loss 大概在 0.01 ~ 0.05 级别
-        # 建议乘 20.0，让最终 Loss 在 0.2 ~ 1.0 之间
-        return {'loss_density': (loss_weighted.sum() / normalizer)/2}
-
-    def loss_density_first(self, outputs, targets, indices, num_boxes, **kwargs):
-        """计算 MSE Loss"""
-        if 'pred_density_map' not in outputs:
-            return {'loss_density': torch.tensor(0.0).to(outputs['pred_boxes'].device)}
-
-        src_map = outputs['pred_density_map']  # [B, 1, H, W]
-        # 优先从 kwargs 获取预计算的 GT Map，避免重复计算
-        if 'gt_density_map' in kwargs:
-            target_map = kwargs['gt_density_map']
-        # 动态生成 GT (不需要梯度)
-        else:
-            with torch.no_grad():
-                target_map = generate_density_map_gt(
-                    targets,
-                    (src_map.shape[0], src_map.shape[2], src_map.shape[3]),
-                    src_map.device,
-                    sigma=2.0,
-                )
-
-        # 计算 MSE
-        loss = F.mse_loss(src_map, target_map)
-        return {'loss_density': loss}
-
+  
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True, **kwargs):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
